@@ -1,6 +1,6 @@
 # RGB-D Point Cloud Project
 
-This project uses four Python scripts to turn RGB and depth images into a 3D point cloud.
+This project uses four Python scripts to turn RGB and depth images into a 3D point cloud
 
 ## Files in this project
 
