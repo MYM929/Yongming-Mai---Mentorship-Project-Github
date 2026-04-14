@@ -35,6 +35,7 @@ Run AFTER  1.make_file_lists.py
 Run BEFORE 3.build_pointcloud.py
 """
 
+import argparse
 import open3d as o3d
 import numpy as np
 import cv2
@@ -148,7 +149,71 @@ PNP_DEPTH_CACHE_SIZE = 15
 VERBOSE_GLOBAL_EDGE_LOG = False
 GLOBAL_EDGE_LOG_LIMIT   = 120
 
-# Reused constants
+# ====================== External config loading ======================
+CONFIGURABLE_KEYS = [
+    "JETSON_CORES", "JETSON_RAM_LIMIT_MB", "JETSON_RAM_WARN_MB",
+    "WIDTH", "HEIGHT", "FX", "FY", "CX", "CY",
+    "ODO_SCALE",
+    "DEPTH_SCALE", "MAX_DEPTH", "MIN_DEPTH", "MAX_DEPTH_DIFF",
+    "MAX_VELOCITY", "MAX_ANGULAR_VEL",
+    "MAX_CONSECUTIVE_SKIP",
+    "LC_STRIDE", "LC_GAPS",
+    "GLC_MIN_INTERVAL", "GLC_ORB_FEATURES", "GLC_MATCH_RATIO",
+    "GLC_MIN_MATCHES", "GLC_MIN_INLIERS", "GLC_RANSAC_THRESH",
+    "GLC_QUERY_STRIDE", "GLC_MAX_CANDIDATES",
+    "GLC_MAX_TRANSLATION", "GLC_MAX_ROTATION",
+    "GLC_ORB_PRESCREEN_K", "GLC_FAST_ONLY_ODO",
+    "GLC_ICP_FITNESS_MIN", "GLC_HEAD_TAIL_N",
+    "DEPTH_ICP_FALLBACK",
+    "ICP_SEQ_VOXELS", "ICP_SEQ_FITNESS_MIN",
+    "GLC_FPFH_ENABLED", "GLC_FPFH_VOXEL",
+    "GLC_FPFH_RADIUS_NORMAL", "GLC_FPFH_RADIUS_FEAT",
+    "GLC_FPFH_QUERY_STRIDE", "GLC_FPFH_RANSAC_DIST",
+    "GLC_FPFH_FITNESS_MIN", "GLC_FPFH_MAX_CANDIDATES",
+    "GLC_FPFH_SPATIAL_MAX_DIST", "GLC_FPFH_SPATIAL_TOPK",
+    "GLC_FPFH_SKIP_ODO_REFINE", "GLC_FPFH_ORB_BACKFILL_ONLY",
+    "IO_WORKERS", "ODO_WORKERS", "FPFH_WORKERS", "GLC_WORKERS",
+    "RGBD_CACHE_SIZE", "PCD_CACHE_SIZE",
+    "PCD_LEVEL_CACHE_SIZE", "PNP_DEPTH_CACHE_SIZE",
+    "VERBOSE_GLOBAL_EDGE_LOG", "GLOBAL_EDGE_LOG_LIMIT",
+]
+
+
+def _load_config_from_file(config_path):
+    """Apply JSON config overrides to module-level constants.
+
+    Only keys listed in CONFIGURABLE_KEYS are applied; unknown keys
+    are warned about but otherwise ignored.
+    """
+    with open(config_path) as f:
+        cfg = json.load(f)
+    g = globals()
+    unknown = [k for k in cfg if k not in CONFIGURABLE_KEYS and k != "_comment"]
+    if unknown:
+        print(f"Warning: unknown config keys ignored: {unknown}")
+    applied = []
+    for k in CONFIGURABLE_KEYS:
+        if k in cfg:
+            g[k] = cfg[k]
+            applied.append(k)
+    g["ODO_W"] = int(g["WIDTH"] * g["ODO_SCALE"])
+    g["ODO_H"] = int(g["HEIGHT"] * g["ODO_SCALE"])
+    g["CPU_COUNT"] = min(os.cpu_count() or 4, g["JETSON_CORES"])
+    g["K_RGB_64"] = np.array(
+        [[g["FX"], 0, g["CX"]], [0, g["FY"], g["CY"]], [0, 0, 1]],
+        dtype=np.float64)
+    print(f"[OK] Loaded config from {config_path} ({len(applied)} keys applied)")
+
+
+_parser = argparse.ArgumentParser(
+    description="Jetson Nano Super Optimized RGB-D Odometry")
+_parser.add_argument("--config", type=str, default=None,
+                     help="Path to JSON config file (partial overrides OK)")
+_args = _parser.parse_args()
+if _args.config:
+    _load_config_from_file(_args.config)
+
+# Reused constants (recomputed after potential config override)
 EYE4    = np.eye(4)
 ZERO66  = np.zeros((6, 6))
 K_RGB_64 = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]], dtype=np.float64)
