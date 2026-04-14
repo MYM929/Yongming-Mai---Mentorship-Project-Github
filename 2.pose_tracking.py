@@ -35,6 +35,7 @@ Run AFTER  1.make_file_lists.py
 Run BEFORE 3.build_pointcloud.py
 """
 
+import argparse
 import open3d as o3d
 import numpy as np
 import cv2
@@ -152,6 +153,71 @@ GLOBAL_EDGE_LOG_LIMIT   = 120
 EYE4    = np.eye(4)
 ZERO66  = np.zeros((6, 6))
 K_RGB_64 = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]], dtype=np.float64)
+
+# ====================== Externalizable parameter keys ======================
+CONFIGURABLE_KEYS = [
+    "JETSON_CORES", "JETSON_RAM_LIMIT_MB", "JETSON_RAM_WARN_MB",
+    "WIDTH", "HEIGHT", "FX", "FY", "CX", "CY",
+    "ODO_SCALE",
+    "DEPTH_SCALE", "MAX_DEPTH", "MIN_DEPTH", "MAX_DEPTH_DIFF",
+    "MAX_VELOCITY", "MAX_ANGULAR_VEL",
+    "MAX_CONSECUTIVE_SKIP",
+    "LC_STRIDE", "LC_GAPS",
+    "GLC_MIN_INTERVAL", "GLC_ORB_FEATURES", "GLC_MATCH_RATIO",
+    "GLC_MIN_MATCHES", "GLC_MIN_INLIERS", "GLC_RANSAC_THRESH",
+    "GLC_QUERY_STRIDE", "GLC_MAX_CANDIDATES", "GLC_MAX_TRANSLATION",
+    "GLC_MAX_ROTATION", "GLC_ORB_PRESCREEN_K", "GLC_FAST_ONLY_ODO",
+    "GLC_ICP_FITNESS_MIN", "GLC_HEAD_TAIL_N",
+    "DEPTH_ICP_FALLBACK", "ICP_SEQ_VOXELS", "ICP_SEQ_FITNESS_MIN",
+    "GLC_FPFH_ENABLED", "GLC_FPFH_VOXEL", "GLC_FPFH_RADIUS_NORMAL",
+    "GLC_FPFH_RADIUS_FEAT", "GLC_FPFH_QUERY_STRIDE", "GLC_FPFH_RANSAC_DIST",
+    "GLC_FPFH_FITNESS_MIN", "GLC_FPFH_MAX_CANDIDATES",
+    "GLC_FPFH_SPATIAL_MAX_DIST", "GLC_FPFH_SPATIAL_TOPK",
+    "GLC_FPFH_SKIP_ODO_REFINE", "GLC_FPFH_ORB_BACKFILL_ONLY",
+    "IO_WORKERS", "ODO_WORKERS", "FPFH_WORKERS", "GLC_WORKERS",
+    "RGBD_CACHE_SIZE", "PCD_CACHE_SIZE", "PCD_LEVEL_CACHE_SIZE",
+    "PNP_DEPTH_CACHE_SIZE",
+    "VERBOSE_GLOBAL_EDGE_LOG", "GLOBAL_EDGE_LOG_LIMIT",
+]
+
+
+def load_config(config_path):
+    """Load a JSON config and override matching module-level constants.
+
+    Returns the raw config dict (for echoing into metrics).
+    Only keys listed in CONFIGURABLE_KEYS are applied; unknown keys
+    are warned about but otherwise ignored.
+    """
+    with open(config_path) as f:
+        cfg = json.load(f)
+    g = globals()
+    unknown = [k for k in cfg if k not in CONFIGURABLE_KEYS]
+    if unknown:
+        print(f"Warning: unknown config keys ignored: {unknown}")
+    for k in CONFIGURABLE_KEYS:
+        if k in cfg:
+            g[k] = cfg[k]
+    # Recompute derived constants that depend on configurable values
+    g["ODO_W"] = int(g["WIDTH"] * g["ODO_SCALE"])
+    g["ODO_H"] = int(g["HEIGHT"] * g["ODO_SCALE"])
+    g["K_RGB_64"] = np.array(
+        [[g["FX"], 0, g["CX"]],
+         [0, g["FY"], g["CY"]],
+         [0, 0, 1]], dtype=np.float64)
+    g["CPU_COUNT"] = min(os.cpu_count() or 4, g["JETSON_CORES"])
+    return cfg
+
+
+def _current_config_snapshot():
+    """Return a dict of all configurable parameters and their active values."""
+    g = globals()
+    snap = {}
+    for k in CONFIGURABLE_KEYS:
+        v = g[k]
+        if isinstance(v, np.ndarray):
+            v = v.tolist()
+        snap[k] = v
+    return snap
 
 
 # ====================== Thread-safe bounded LRU cache ======================
@@ -544,7 +610,37 @@ def save_tum_trajectory(trajectory, filename):
 
 # ==================================================================
 def main():
+    parser = argparse.ArgumentParser(
+        description="Jetson Nano Super Optimized RGB-D Odometry")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to JSON config file (partial overrides OK)")
+    args = parser.parse_args()
+
+    config_used = {}
+    if args.config:
+        config_used = load_config(args.config)
+        print(f"[CONFIG] Loaded {len(config_used)} override(s) from "
+              f"{args.config}")
+
     wall_start = time.time()
+
+    metrics = {
+        "total_frames": 0,
+        "accepted_frames": 0,
+        "skipped_frames": 0,
+        "icp_fallback_count": 0,
+        "local_lc_attempts": 0,
+        "local_lc_accepted": 0,
+        "orb_lc_attempts": 0,
+        "orb_lc_accepted": 0,
+        "fpfh_lc_attempts": 0,
+        "fpfh_lc_accepted": 0,
+        "head_tail_closure_fired": False,
+        "icp_fitness_values": [],
+        "mean_icp_fitness": None,
+        "total_runtime_seconds": None,
+        "config": _current_config_snapshot(),
+    }
 
     print("=" * 62)
     print("  JETSON NANO SUPER – Optimised RGB-D Odometry + Pose Graph")
@@ -574,6 +670,7 @@ def main():
 
     pairs = load_frame_pairs()
     n = len(pairs)
+    metrics["total_frames"] = n
     print(f"[OK] {n} RGB-D frame pairs loaded.\n")
     if n < 2:
         print("Need at least 2 frames.")
@@ -854,6 +951,9 @@ def main():
 
     accepted = best_seg
     n_acc = len(accepted)
+    metrics["accepted_frames"] = n_acc
+    metrics["skipped_frames"] = n - n_acc
+    metrics["icp_fallback_count"] = icp_used
     print(f"  Building pose graph for {n_acc} accepted frames.\n")
 
     # ==============================================================
@@ -915,6 +1015,8 @@ def main():
                 j, k, trans, info, uncertain=True))
     lc_ok = len(lc_edges)
 
+    metrics["local_lc_attempts"] = lc_tried
+    metrics["local_lc_accepted"] = lc_ok
     print(f"  Local loop closures: {lc_ok}/{lc_tried} accepted  "
           f"({time.time() - t_phase2:.1f}s)\n")
 
@@ -930,10 +1032,11 @@ def main():
     def try_icp_edge(q_node, t_node, init,
                      refine_with_odometry=True,
                      odometry_full_retry=False):
+        """Returns (ok, transform, info, icp_fitness)."""
         pcd_s = get_pcd(q_node)
         pcd_t = get_pcd(t_node)
         if pcd_s is None or pcd_t is None:
-            return False, None, None
+            return False, None, None, 0.0
         s_idx = accepted[q_node]
         t_idx = accepted[t_node]
         current_T = init.copy()
@@ -952,23 +1055,23 @@ def main():
             fitness = result.fitness
         T_icp = current_T
         if fitness < GLC_ICP_FITNESS_MIN:
-            return False, None, None
+            return False, None, None, fitness
         tn = np.linalg.norm(T_icp[:3, 3])
         an = rotation_angle(T_icp[:3, :3])
         if tn > GLC_MAX_TRANSLATION or an > GLC_MAX_ROTATION:
-            return False, None, None
+            return False, None, None, fitness
         if not refine_with_odometry:
             info_icp = np.eye(6) * max(fitness * 10000, 500)
-            return True, T_icp, info_icp
+            return True, T_icp, info_icp, fitness
         ok, trans, info = try_odometry_fast_then_full(
             s_idx, t_idx, T_icp, full_retry=odometry_full_retry)
         if ok:
             tn2 = np.linalg.norm(trans[:3, 3])
             an2 = rotation_angle(trans[:3, :3])
             if tn2 <= GLC_MAX_TRANSLATION and an2 <= GLC_MAX_ROTATION:
-                return True, trans, info
+                return True, trans, info, fitness
         info_icp = np.eye(6) * max(fitness * 10000, 500)
-        return True, T_icp, info_icp
+        return True, T_icp, info_icp, fitness
 
     # ---- Map pre-extracted ORB features to accepted-frame nodes ----
     print("  Mapping ORB features to accepted frames...")
@@ -1088,13 +1191,13 @@ def main():
                     local_closed = True
                     continue
 
-            ok_icp, T_icp, info_icp = try_icp_edge(
+            ok_icp, T_icp, info_icp, icp_fit = try_icp_edge(
                 q, t_node, init,
                 refine_with_odometry=True,
                 odometry_full_retry=(not GLC_FAST_ONLY_ODO))
             if ok_icp:
                 local_edges.append(
-                    (q, t_node, T_icp, info_icp, n_inliers, "icp"))
+                    (q, t_node, T_icp, info_icp, n_inliers, "icp", icp_fit))
                 local_closed = True
 
         return q, local_tried, local_closed, local_edges
@@ -1109,13 +1212,19 @@ def main():
         glc_tried += local_tried
         if local_closed:
             orb_closed_queries.add(q)
-        for a, b, trans, info, n_inliers, method in local_edges:
+        for edge in local_edges:
+            a, b, trans, info, n_inliers, method = edge[:6]
+            icp_fit = edge[6] if len(edge) > 6 else None
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
                     a, b, trans, info, uncertain=True))
             glc_ok += 1
             glc_edges.append((a, b, n_inliers, method))
+            if icp_fit is not None and icp_fit > 0:
+                metrics["icp_fitness_values"].append(icp_fit)
 
+    metrics["orb_lc_attempts"] = glc_tried
+    metrics["orb_lc_accepted"] = glc_ok
     print(f"  ORB-based global LC: {glc_ok}/{glc_tried} verified & added")
     _mem_check("after ORB global LC")
 
@@ -1268,12 +1377,12 @@ def main():
                 if ransac_result.fitness < GLC_FPFH_FITNESS_MIN:
                     continue
 
-                ok_icp, T_icp, info_icp = try_icp_edge(
+                ok_icp, T_icp, info_icp, icp_fit = try_icp_edge(
                     q, t, ransac_result.transformation,
                     refine_with_odometry=(not GLC_FPFH_SKIP_ODO_REFINE),
                     odometry_full_retry=False)
                 if ok_icp:
-                    local_edges.append((q, t, T_icp, info_icp))
+                    local_edges.append((q, t, T_icp, info_icp, icp_fit))
 
             return q, local_tried, local_edges
 
@@ -1286,7 +1395,7 @@ def main():
         fpfh_results.sort(key=lambda x: x[0])
         for _, local_tried, local_edges in fpfh_results:
             fpfh_tried += local_tried
-            for q, t, T_icp, info_icp in local_edges:
+            for q, t, T_icp, info_icp, icp_fit in local_edges:
                 key = (min(q, t), max(q, t))
                 if key in seen_pairs:
                     continue
@@ -1296,7 +1405,11 @@ def main():
                         q, t, T_icp, info_icp, uncertain=True))
                 fpfh_ok += 1
                 glc_edges.append((q, t, 0, "fpfh"))
+                if icp_fit > 0:
+                    metrics["icp_fitness_values"].append(icp_fit)
 
+        metrics["fpfh_lc_attempts"] = fpfh_tried
+        metrics["fpfh_lc_accepted"] = fpfh_ok
         print(f"  FPFH-based global LC: {fpfh_ok}/{fpfh_tried} "
               f"verified & added")
     else:
@@ -1321,13 +1434,15 @@ def main():
                 pose_init = np.linalg.inv(poses[t_idx]) @ poses[s_idx]
                 best_ok = False
                 best_T = best_info = None
+                best_fit = 0.0
                 for init_guess in [pose_init, EYE4]:
-                    ok_i, T_i, info_i = try_icp_edge(
+                    ok_i, T_i, info_i, fit_i = try_icp_edge(
                         t_n, h_n, init_guess,
                         refine_with_odometry=True,
                         odometry_full_retry=(not GLC_FAST_ONLY_ODO))
                     if ok_i:
-                        best_ok, best_T, best_info = True, T_i, info_i
+                        best_ok, best_T, best_info, best_fit = (
+                            True, T_i, info_i, fit_i)
                         break
                 if best_ok:
                     pose_graph.edges.append(
@@ -1336,9 +1451,13 @@ def main():
                     ht_ok += 1
                     glc_edges.append((t_n, h_n, 0, "ht-icp"))
                     existing.add((t_n, h_n))
+                    if best_fit > 0:
+                        metrics["icp_fitness_values"].append(best_fit)
         print(f"  Head-tail ICP loop closures: {ht_ok} added")
     else:
         print("  Trajectory too short for head-tail ICP check.")
+
+    metrics["head_tail_closure_fired"] = ht_ok > 0
 
     glc_total = glc_ok + fpfh_ok + ht_ok
     if glc_edges:
@@ -1409,6 +1528,23 @@ def main():
     print(f"    {pcd_level_cache.stats()}")
     print(f"    {pnp_depth_lru.stats()}")
     print()
+
+    # ---- Finalize and write metrics ----
+    metrics["total_runtime_seconds"] = round(elapsed, 3)
+    fit_vals = metrics["icp_fitness_values"]
+    if fit_vals:
+        metrics["mean_icp_fitness"] = round(
+            sum(fit_vals) / len(fit_vals), 6)
+    else:
+        metrics["mean_icp_fitness"] = None
+
+    metrics_path = os.environ.get(
+        "METRICS_OUT", os.path.join(BASE_DIR, "metrics.json"))
+    os.makedirs(os.path.dirname(os.path.abspath(metrics_path)), exist_ok=True)
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"[METRICS] Written to {metrics_path}")
+
     print("Run 3.build_pointcloud.py next.")
 
 
