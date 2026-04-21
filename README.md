@@ -85,6 +85,60 @@ python 3.build_pointcloud.py
 python 4.visualize_pointcloud.py
 ```
 
+## Run TUM benchmark from beginning
+
+Use these steps to run the full TUM calibration/evaluation flow end-to-end.
+
+### 1) Install dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+### 2) Download TUM sequences
+
+```powershell
+New-Item -ItemType Directory -Force -Path tum_data | Out-Null
+
+curl.exe -L -o "tum_data\rgbd_dataset_freiburg1_room.tgz" "https://cvg.cit.tum.de/rgbd/dataset/freiburg1/rgbd_dataset_freiburg1_room.tgz"
+curl.exe -L -o "tum_data\rgbd_dataset_freiburg3_long_office_household.tgz" "https://cvg.cit.tum.de/rgbd/dataset/freiburg3/rgbd_dataset_freiburg3_long_office_household.tgz"
+
+tar -xzf "tum_data\rgbd_dataset_freiburg1_room.tgz" -C "tum_data"
+tar -xzf "tum_data\rgbd_dataset_freiburg3_long_office_household.tgz" -C "tum_data"
+```
+
+### 3) Run FR1 pipeline
+
+```powershell
+python tum_to_dataset.py "tum_data\rgbd_dataset_freiburg1_room" --clean
+python 1.make_file_lists.py
+python 2.pose_tracking.py --config tum_fr1_config.json
+```
+
+### 4) Evaluate FR1 with evo
+
+```powershell
+$env:MPLBACKEND="Agg"
+evo_ape tum dataset\groundtruth.txt dataset\pose_trajectory.txt --align --correct_scale --save_plot tum_results\fr1_room\ate_plot.png --save_results tum_results\fr1_room\ate_results.zip -v
+evo_traj tum dataset\groundtruth.txt dataset\pose_trajectory.txt --ref dataset\groundtruth.txt --align --correct_scale --save_plot tum_results\fr1_room\traj_overlay.png -v
+```
+
+### 5) Run FR3 pipeline
+
+```powershell
+python tum_to_dataset.py "tum_data\rgbd_dataset_freiburg3_long_office_household" --clean
+python 1.make_file_lists.py
+python 2.pose_tracking.py --config tum_fr3_config.json
+```
+
+### 6) Evaluate FR3 with evo
+
+```powershell
+$env:MPLBACKEND="Agg"
+evo_ape tum dataset\groundtruth.txt dataset\pose_trajectory.txt --align --correct_scale --save_plot tum_results\fr3_long_office\ate_plot.png --save_results tum_results\fr3_long_office\ate_results.zip -v
+evo_traj tum dataset\groundtruth.txt dataset\pose_trajectory.txt --ref dataset\groundtruth.txt --align --correct_scale --save_plot tum_results\fr3_long_office\traj_overlay.png -v
+```
+
 ## Output files
 
 After running the scripts, these files are created or used:
