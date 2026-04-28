@@ -1,6 +1,0 @@
-numpy==1.26.4
-opencv-python==4.11.0.86
-open3d==0.19.0
-awscli==1.44.82
-boto3==1.42.92
-evo==1.35.2
