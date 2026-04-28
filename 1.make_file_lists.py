@@ -1,5 +1,5 @@
 """
-Generate rgb.txt and depth.txt for the dataset selected in dataset_config.json.
+Generate rgb.txt and depth.txt for the dataset selected in config.json.
 Run this after copying new RGB and depth images into the chosen dataset folder.
 """
 import json
@@ -8,13 +8,13 @@ import re
 
 # ================= Configuration =================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "dataset_config.json")
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 DATASETS_ROOT = os.path.join(SCRIPT_DIR, "datasets")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
 
 
-def load_dataset_config():
-    """Load the selected dataset folder from dataset_config.json."""
+def load_config():
+    """Load the selected dataset folder from config.json."""
     if not os.path.exists(CONFIG_PATH):
         raise FileNotFoundError(
             f"Missing config file: {CONFIG_PATH}. Create it with an 'active_dataset' entry."
@@ -36,7 +36,7 @@ def load_dataset_config():
     return dataset_name, base_dir
 
 
-ACTIVE_DATASET, BASE_DIR = load_dataset_config()
+ACTIVE_DATASET, BASE_DIR = load_config()
 RGB_DIR = os.path.join(BASE_DIR, "rgb")
 DEPTH_DIR = os.path.join(BASE_DIR, "depth")
 RGB_TXT = os.path.join(BASE_DIR, "rgb.txt")
