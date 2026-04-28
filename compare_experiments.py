@@ -1,13 +1,12 @@
 import argparse
 import csv
-import json
 import math
 import os
 
+from experiment_config import collect_run_summary_paths, load_dataset_config
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "dataset_config.json")
-DATASETS_ROOT = os.path.join(SCRIPT_DIR, "datasets")
 
 IMPORTANT_COLUMNS = [
     "timestamp",
@@ -41,15 +40,9 @@ QUALITY_RANK = {
 }
 
 
-def load_active_reports_dir():
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(f"Missing config file: {CONFIG_PATH}")
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    active_dataset = config.get("active_dataset")
-    if not active_dataset:
-        raise ValueError("'active_dataset' is missing in dataset_config.json")
-    return os.path.join(DATASETS_ROOT, active_dataset, "reports")
+def load_default_experiments_dir():
+    config = load_dataset_config()
+    return config["dataset_experiments_dir"]
 
 
 def to_float(value):
@@ -153,18 +146,30 @@ def main():
         description="Compare pose trajectory experiment summary rows.")
     parser.add_argument("--sort", help="CSV column to sort by.")
     parser.add_argument(
-        "--reports",
-        help="Reports folder. Defaults to the active dataset reports folder.",
+        "--config",
+        help="Config file path. Defaults to the config selected by config.json.",
+    )
+    parser.add_argument(
+        "--experiments",
+        help="Dataset experiment folder. Defaults to the active dataset experiments folder.",
     )
     args = parser.parse_args()
 
-    reports_dir = args.reports or load_active_reports_dir()
-    summary_path = os.path.join(reports_dir, "experiment_summary.csv")
-    if not os.path.exists(summary_path):
-        raise FileNotFoundError(f"Missing experiment summary: {summary_path}")
+    experiments_dir = args.experiments or (
+        load_dataset_config(args.config)["dataset_experiments_dir"]
+        if args.config
+        else load_default_experiments_dir()
+    )
+    summary_paths = collect_run_summary_paths(experiments_dir)
+    if not summary_paths:
+        raise FileNotFoundError(
+            f"No experiment summaries found under {experiments_dir}"
+        )
 
-    with open(summary_path, "r", newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    rows = []
+    for summary_path in summary_paths:
+        with open(summary_path, "r", newline="", encoding="utf-8") as f:
+            rows.extend(csv.DictReader(f))
     if not rows:
         print("No experiments found.")
         return
@@ -177,7 +182,7 @@ def main():
     columns = [col for col in IMPORTANT_COLUMNS if col in rows[0]]
     print_table(rows, columns)
 
-    comparison_path = os.path.join(reports_dir, "experiment_comparison.md")
+    comparison_path = os.path.join(experiments_dir, "experiment_comparison.md")
     save_markdown(rows, columns, comparison_path)
     print(f"\nSaved comparison report to {comparison_path}")
 

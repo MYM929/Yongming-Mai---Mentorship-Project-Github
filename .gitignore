@@ -1,3 +1,4 @@
 # Ignore local datasets/artifacts
 /datasets/
 /reports/
+/experiments/

@@ -49,6 +49,8 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+from experiment_config import create_next_run_dir, load_dataset_config
+
 try:
     cv2.setNumThreads(1)
 except Exception:
@@ -61,34 +63,10 @@ JETSON_RAM_WARN_MB = 4000
 
 # ====================== Configuration (Jetson-tuned) ======================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
-DATASETS_ROOT = os.path.join(SCRIPT_DIR, "datasets")
-
-
-def load_config():
-    """Load the selected dataset folder from config.json."""
-    if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(
-            f"Missing config file: {CONFIG_PATH}. Create it with an 'active_dataset' entry."
-        )
-
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    dataset_name = config.get("active_dataset")
-    if not dataset_name:
-        raise ValueError(f"'active_dataset' is missing or empty in {CONFIG_PATH}")
-
-    base_dir = os.path.join(DATASETS_ROOT, dataset_name)
-    if not os.path.isdir(base_dir):
-        raise FileNotFoundError(
-            f"Configured dataset folder does not exist: {base_dir}"
-        )
-
-    return dataset_name, base_dir
-
-
-ACTIVE_DATASET, BASE_DIR = load_config()
+PROJECT_CONFIG = load_dataset_config()
+ACTIVE_DATASET = PROJECT_CONFIG["dataset_name"]
+BASE_DIR = PROJECT_CONFIG["dataset_dir"]
+DATASET_EXPERIMENTS_DIR = PROJECT_CONFIG["dataset_experiments_dir"]
 
 # Camera intrinsics (full resolution)
 WIDTH, HEIGHT = 1280, 720
@@ -779,23 +757,21 @@ def _fmt_int(value):
         return "N/A"
 
 
-def save_metrics_report(metrics, base_dir):
-    reports_dir = os.path.join(base_dir, "reports")
-    os.makedirs(reports_dir, exist_ok=True)
-
+def save_metrics_report(metrics, run_dir):
     timestamp = metrics.get("timestamp") or datetime.now().strftime(
         "%Y-%m-%d %H:%M:%S")
     metrics["timestamp"] = timestamp
     file_stamp = timestamp.replace("-", "").replace(":", "").replace(" ", "_")
+    metrics["run_dir"] = run_dir
 
     metrics["quality_judgment"] = make_quality_judgment(metrics)
     for key, value in metrics["quality_judgment"].items():
         metrics[key] = value
 
     metrics = _json_ready(metrics)
-    json_path = os.path.join(reports_dir, f"metrics_{file_stamp}.json")
-    md_path = os.path.join(reports_dir, f"metrics_{file_stamp}.md")
-    csv_path = os.path.join(reports_dir, "experiment_summary.csv")
+    json_path = os.path.join(run_dir, f"metrics_{file_stamp}.json")
+    md_path = os.path.join(run_dir, f"metrics_{file_stamp}.md")
+    csv_path = os.path.join(run_dir, "experiment_summary.csv")
 
     memory_values = [
         safe_float(metrics.get(k))
@@ -980,7 +956,10 @@ def main():
         "parameters": build_parameter_snapshot(),
         "startup_memory_mb": get_memory_mb_safe(),
     }
+    run_dir = create_next_run_dir(DATASET_EXPERIMENTS_DIR)
+    metrics["run_dir"] = run_dir
     print(f"  Active dataset: {ACTIVE_DATASET}")
+    print(f"  Experiment run: {run_dir}")
 
     print("=" * 62)
     print("  JETSON NANO SUPER – Optimised RGB-D Odometry + Pose Graph")
@@ -1023,7 +1002,7 @@ def main():
             "sequential_success_rate": 0.0,
             "total_wall_time_sec": time.time() - wall_start,
         })
-        report_paths = save_metrics_report(metrics, SCRIPT_DIR)
+        report_paths = save_metrics_report(metrics, run_dir)
         print(f"Reports saved to {report_paths['json']} and "
               f"{report_paths['markdown']}")
         return
@@ -1928,7 +1907,7 @@ def main():
     print(f"    {pcd_cache_stats}")
     print(f"    {pcd_level_cache_stats}")
     print(f"    {pnp_depth_cache_stats}")
-    report_paths = save_metrics_report(metrics, SCRIPT_DIR)
+    report_paths = save_metrics_report(metrics, run_dir)
     print(f"Reports saved to {report_paths['json']} and "
           f"{report_paths['markdown']}")
     print()
