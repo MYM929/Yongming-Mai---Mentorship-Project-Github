@@ -1,14 +1,15 @@
-# Local datasets/artifacts
-/datasets/
-/reports/
-/experiments/
+.git
+.gitignore
+.dockerignore
 
-# Python cache
 __pycache__/
 *.pyc
 *.pyo
 
-# Local virtual environments
+datasets/
+experiments/
+reports/
+
 .venv/
 venv/
 env/
@@ -21,6 +22,5 @@ trust-*.json
 pose-tracking-policy.json
 trust-ec2.json
 
-# Logs/temp files
 *.log
 *.tmp
