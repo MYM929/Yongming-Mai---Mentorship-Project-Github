@@ -2,25 +2,52 @@
 .gitignore
 .dockerignore
 
-__pycache__/
-*.pyc
-*.pyo
-
+# Runtime data and generated outputs are downloaded/uploaded through S3.
 datasets/
 experiments/
 reports/
+configs/adaptive/
+configs/*_adaptive_*.json
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local environments and credentials
+.env
+.env.*
+!.env.example
+.aws/
+.aws-sam/
 
 .venv/
 venv/
 env/
 
-# Local AWS/EC2 helper files and private keys
+# Private keys and generated IAM helper files
 *.pem
+*.key
 *-key.*
 *-policy.json
 trust-*.json
-pose-tracking-policy.json
-trust-ec2.json
+
+# Local-only docs and OS/editor noise
+AWS_DEPLOYMENT.md
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
 
 *.log
 *.tmp
+*.bak
+*.swp

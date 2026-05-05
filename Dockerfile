@@ -26,6 +26,7 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install -r requirements.txt
 
 COPY 1.pose_tracking.py experiment_config.py docker_entrypoint.py ./
+COPY scripts/generate_next_adaptive_config.py ./scripts/generate_next_adaptive_config.py
 
 RUN mkdir -p /app/configs /app/datasets /app/experiments
 

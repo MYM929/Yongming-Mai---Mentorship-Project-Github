@@ -1,26 +1,50 @@
-# Local datasets/artifacts
+# Local datasets and generated outputs
 /datasets/
-/reports/
 /experiments/
+/reports/
+/configs/adaptive/
+/configs/*_adaptive_*.json
 
-# Python cache
+# Python caches and build artifacts
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 
-# Local virtual environments
+# Local environments
 .venv/
 venv/
 env/
 
-# Local AWS/EC2 helper files and private keys
+# Local environment files and AWS credentials
+.env
+.env.*
+!.env.example
+.aws/
+.aws-sam/
+
+# Private keys and generated IAM helper files
 *.pem
+*.key
 *-key.*
 *-policy.json
 trust-*.json
-pose-tracking-policy.json
-trust-ec2.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
 
 # Logs/temp files
 *.log
 *.tmp
+*.bak
+*.swp
