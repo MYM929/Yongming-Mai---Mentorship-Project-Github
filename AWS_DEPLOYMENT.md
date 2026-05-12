@@ -105,10 +105,10 @@ per accepted frame.
 
 Set `ADAPTIVE_MODE=bayes_opt` to use Optuna TPE Bayesian optimization instead of
 the conservative one-step heuristic. In this mode `EXPERIMENT_COUNT` is treated
-as the maximum trial budget, defaulting to 12 in the submit scripts when it is
+as the maximum trial budget, defaulting to 24 in the submit scripts when it is
 not set. Each dataset optimizes independently, and the container may stop early
-after at least 5 trials when the best quality-first objective improves by less
-than 0.01 for 3 consecutive trials. The final report includes the actual number
+after at least 12 trials when the best quality-first objective improves by less
+than 0.002 for 8 consecutive trials. The final report includes the actual number
 of experiments used, the objective score, constraint status, and early-stop
 reason.
 
@@ -186,7 +186,7 @@ Defaults:
 ```text
 DATASET_CONFIGS=dataset_1_bedroom.json,dataset_2_meeting_room.json
 ADAPTIVE_MODE=metric_conservative
-EXPERIMENT_COUNT=3 for metric_conservative, 12 for bayes_opt
+EXPERIMENT_COUNT=3 for metric_conservative, 24 for bayes_opt
 BATCH_RUN_ID=<UTC timestamp>
 ```
 
@@ -258,7 +258,7 @@ CONFIG_NAME
 Optional:
 
 ```text
-EXPERIMENT_COUNT=1 for metric_conservative, 12 for bayes_opt
+EXPERIMENT_COUNT=1 for metric_conservative, 24 for bayes_opt
 BATCH_RUN_ID=<generated if not provided>
 ADAPTIVE_MODE=metric_conservative or bayes_opt
 ```

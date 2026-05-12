@@ -682,7 +682,7 @@ def main():
     adaptive_mode = os.environ.get("ADAPTIVE_MODE", "metric_conservative")
     config_name = os.environ.get("CONFIG_NAME", DEFAULT_CONFIG_NAME)
     experiment_count = _get_experiment_count(
-        "12" if adaptive_mode == BAYES_MODE else "1"
+        "24" if adaptive_mode == BAYES_MODE else "1"
     )
     batch_run_id_value = os.environ.get("BATCH_RUN_ID")
     batch_run_id = (

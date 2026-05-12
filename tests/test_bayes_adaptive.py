@@ -79,18 +79,18 @@ class BayesianAdaptiveTests(unittest.TestCase):
         self.assertIn("need at least", decision["reason"])
 
     def test_early_stopping_detects_plateau(self):
+        scores = [0.5, 0.7, 0.8, 0.9]
+        scores.extend([0.9005, 0.901, 0.9015, 0.902])
+        scores.extend([0.9025, 0.903, 0.9035, 0.904])
         records = [
-            {"sequence_number": 1, "objective_score": 0.5},
-            {"sequence_number": 2, "objective_score": 0.7},
-            {"sequence_number": 3, "objective_score": 0.705},
-            {"sequence_number": 4, "objective_score": 0.706},
-            {"sequence_number": 5, "objective_score": 0.707},
+            {"sequence_number": index, "objective_score": score}
+            for index, score in enumerate(scores, start=1)
         ]
 
         decision = adaptive.should_stop_bayes_early(records)
 
         self.assertTrue(decision["should_stop"])
-        self.assertEqual(decision["best_sequence_number"], 5)
+        self.assertEqual(decision["best_sequence_number"], 12)
 
     def test_apply_bayes_params_stays_inside_expected_bounds(self):
         if importlib.util.find_spec("optuna") is None:
@@ -103,7 +103,6 @@ class BayesianAdaptiveTests(unittest.TestCase):
             "local_stride": -5,
             "orb_features_per_frame": 12345,
             "fpfh_voxel_size": 0.01,
-            "cache_rgbd": 1,
         })
 
         next_cfg = adaptive.apply_bayes_params_to_config(copy.deepcopy(cfg), params)
@@ -116,7 +115,7 @@ class BayesianAdaptiveTests(unittest.TestCase):
             1000,
         )
         self.assertGreaterEqual(pt_cfg["fpfh_global_loop_closure"]["voxel_size"], 0.06)
-        self.assertGreaterEqual(pt_cfg["caches"]["rgbd"], 20)
+        self.assertEqual(pt_cfg["caches"], cfg["pose_tracking"]["caches"])
 
     def test_metric_conservative_still_generates_metadata(self):
         cfg = load_config()
@@ -164,6 +163,39 @@ class BayesianAdaptiveTests(unittest.TestCase):
         self.assertEqual(next_cfg["adaptive_metadata"]["mode"], adaptive.BAYES_MODE)
         self.assertEqual(next_cfg["adaptive_metadata"]["history_trials"], 6)
         self.assertIn("suggested_params", next_cfg["adaptive_metadata"])
+        self.assertIn("duplicate_suggestion_retries", next_cfg["adaptive_metadata"])
+
+    def test_bayes_generation_avoids_duplicate_params(self):
+        if importlib.util.find_spec("optuna") is None:
+            self.skipTest("optuna is not installed in this environment")
+
+        cfg = load_config()
+        history = []
+        for index in range(1, 10):
+            params = adaptive.extract_bayes_params_from_config(cfg)
+            params["odometry_scale"] = min(0.4, 0.2 + index * 0.01)
+            history.append({
+                "sequence_number": index,
+                "params": params,
+                "objective_score": 0.5 + index * 0.01,
+                "constraint_status": "ok",
+                "quality_score": 0.5 + index * 0.01,
+                "speed_score": 0.5,
+            })
+
+        next_cfg = adaptive.generate_next_config(
+            cfg,
+            good_metrics(),
+            adaptive_index=9,
+            mode=adaptive.BAYES_MODE,
+            trial_history=history,
+            dataset_name="dataset_1_bedroom",
+            batch_run_id="unit-test",
+        )
+        suggested = next_cfg["adaptive_metadata"]["suggested_params"]
+        tried = {adaptive._bayes_param_key(record["params"]) for record in history}
+
+        self.assertNotIn(adaptive._bayes_param_key(suggested), tried)
 
 
 if __name__ == "__main__":

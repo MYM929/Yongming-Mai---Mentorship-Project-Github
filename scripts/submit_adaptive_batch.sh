@@ -12,7 +12,7 @@ DATASET_CONFIGS="${DATASET_CONFIGS:-dataset_1_bedroom.json,dataset_2_meeting_roo
 ADAPTIVE_MODE="${ADAPTIVE_MODE:-metric_conservative}"
 if [[ -z "${EXPERIMENT_COUNT:-}" ]]; then
   if [[ "${ADAPTIVE_MODE}" == "bayes_opt" ]]; then
-    EXPERIMENT_COUNT="12"
+    EXPERIMENT_COUNT="24"
   else
     EXPERIMENT_COUNT="3"
   fi

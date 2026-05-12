@@ -10,9 +10,10 @@ from pathlib import Path
 CONSERVATIVE_MODE = "metric_conservative"
 BAYES_MODE = "bayes_opt"
 BAYES_FAILED_SCORE = -1000.0
-BAYES_MIN_TRIALS = 5
-BAYES_PATIENCE = 3
-BAYES_MIN_DELTA = 0.01
+BAYES_MIN_TRIALS = 12
+BAYES_PATIENCE = 8
+BAYES_MIN_DELTA = 0.002
+BAYES_DUPLICATE_RETRY_LIMIT = 32
 BAYES_GAP_CHOICES = ("3", "3_5", "3_5_7")
 
 
@@ -259,10 +260,6 @@ def _bayes_distributions():
         "fpfh_max_candidates": IntDistribution(1, 3),
         "fpfh_spatial_top_k": IntDistribution(10, 35),
         "fpfh_ransac_max_iterations": IntDistribution(1500, 5000, step=500),
-        "cache_rgbd": IntDistribution(20, 60),
-        "cache_pcd": IntDistribution(15, 50),
-        "cache_pcd_level": IntDistribution(30, 100),
-        "cache_pnp_depth": IntDistribution(8, 20),
     }
 
 
@@ -273,7 +270,6 @@ def extract_bayes_params_from_config(config):
     local = pt_cfg["local_loop_closure"]
     orb = pt_cfg["orb_global_loop_closure"]
     fpfh = pt_cfg["fpfh_global_loop_closure"]
-    caches = pt_cfg.get("caches", {})
     fast_iterations = list(odom["fast_iterations"])
     full_iterations = list(odom["full_iterations"])
     return {
@@ -300,10 +296,6 @@ def extract_bayes_params_from_config(config):
         "fpfh_ransac_max_iterations": int(
             round(int(fpfh["ransac_max_iterations"]) / 500) * 500
         ),
-        "cache_rgbd": int(caches.get("rgbd", 50)),
-        "cache_pcd": int(caches.get("pcd", 40)),
-        "cache_pcd_level": int(caches.get("pcd_level", 80)),
-        "cache_pnp_depth": int(caches.get("pnp_depth", 15)),
     }
 
 
@@ -373,11 +365,6 @@ def apply_bayes_params_to_config(config, params):
     fpfh["spatial_top_k"] = int(params["fpfh_spatial_top_k"])
     fpfh["ransac_max_iterations"] = int(params["fpfh_ransac_max_iterations"])
 
-    caches = pt_cfg.setdefault("caches", {})
-    caches["rgbd"] = int(params["cache_rgbd"])
-    caches["pcd"] = int(params["cache_pcd"])
-    caches["pcd_level"] = int(params["cache_pcd_level"])
-    caches["pnp_depth"] = int(params["cache_pnp_depth"])
     return next_config
 
 
@@ -415,6 +402,7 @@ def evaluate_bayes_objective(metrics, pt_cfg):
     fpfh_rate = _number(metrics.get("fpfh_glc_accept_rate"), 0.0)
 
     good_ratio = _number(qj.get("good_accepted_ratio"), 0.85)
+    low_drift = _number(qj.get("low_drift_m"), 0.1)
     medium_drift = _number(qj.get("medium_drift_m"), 0.3)
     moderate_runtime = _number(qj.get("moderate_runtime_per_frame_sec"), 2.0)
     memory_warn = _number(jetson.get("ram_warn_mb"), 4000.0)
@@ -430,7 +418,14 @@ def evaluate_bayes_objective(metrics, pt_cfg):
         constraint_violations.append("high_memory")
 
     segment_score = 1.0 if segments <= 1 else max(0.0, 1.0 - 0.25 * (segments - 1))
-    drift_score = 1.0 if drift is None else max(0.0, 1.0 - min(drift / medium_drift, 2.0) * 0.5)
+    if drift is None:
+        drift_score = 1.0
+    elif drift <= low_drift:
+        drift_score = 1.0
+    elif drift <= medium_drift:
+        drift_score = 1.0 - ((drift - low_drift) / (medium_drift - low_drift)) * 0.5
+    else:
+        drift_score = max(0.0, 0.5 - min((drift - medium_drift) / medium_drift, 1.0) * 0.5)
     loop_score = min(
         1.0,
         (global_lc / 20.0) * 0.4
@@ -439,9 +434,9 @@ def evaluate_bayes_objective(metrics, pt_cfg):
         + fpfh_rate * 0.15,
     )
     quality_score = (
-        accepted * 0.45
+        accepted * 0.4
         + segment_score * 0.25
-        + drift_score * 0.2
+        + drift_score * 0.25
         + loop_score * 0.1
     )
 
@@ -552,11 +547,30 @@ def _suggest_bayes_params(trial):
         "fpfh_ransac_max_iterations": trial.suggest_int(
             "fpfh_ransac_max_iterations", 1500, 5000, step=500
         ),
-        "cache_rgbd": trial.suggest_int("cache_rgbd", 20, 60),
-        "cache_pcd": trial.suggest_int("cache_pcd", 15, 50),
-        "cache_pcd_level": trial.suggest_int("cache_pcd_level", 30, 100),
-        "cache_pnp_depth": trial.suggest_int("cache_pnp_depth", 8, 20),
     }
+
+
+def _bayes_param_key(params):
+    return json.dumps(
+        _normalize_bayes_params(params),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _suggest_unique_bayes_params(study, tried_param_keys):
+    fallback = None
+    duplicate_attempts = 0
+    for _ in range(BAYES_DUPLICATE_RETRY_LIMIT):
+        trial = study.ask()
+        params = _suggest_bayes_params(trial)
+        key = _bayes_param_key(params)
+        fallback = params
+        if key not in tried_param_keys:
+            return params, duplicate_attempts
+        duplicate_attempts += 1
+        study.tell(trial, BAYES_FAILED_SCORE)
+    return fallback, duplicate_attempts
 
 
 def _load_trial_history(path):
@@ -575,8 +589,8 @@ def _generate_bayes_config(previous_config, metrics, adaptive_index,
                            trial_history, dataset_name, batch_run_id):
     optuna, _, _, _ = _require_optuna()
     distributions = _bayes_distributions()
-    seed = _seed_from_parts(batch_run_id, dataset_name)
-    sampler = optuna.samplers.TPESampler(seed=seed, n_startup_trials=3)
+    seed = _seed_from_parts(batch_run_id, dataset_name, adaptive_index)
+    sampler = optuna.samplers.TPESampler(seed=seed, n_startup_trials=8)
     study = optuna.create_study(direction="maximize", sampler=sampler)
 
     trials = list(trial_history or [])
@@ -592,23 +606,25 @@ def _generate_bayes_config(previous_config, metrics, adaptive_index,
             "speed_score": objective["speed_score"],
         })
 
+    tried_param_keys = set()
     for record in trials:
         params = record.get("params")
         value = _number(record.get("objective_score"))
         if not params or value is None:
             continue
         try:
+            normalized_params = _normalize_bayes_params(params)
             trial = optuna.trial.create_trial(
-                params=_normalize_bayes_params(params),
+                params=normalized_params,
                 distributions=distributions,
                 value=value,
             )
             study.add_trial(trial)
+            tried_param_keys.add(_bayes_param_key(normalized_params))
         except ValueError:
             continue
 
-    trial = study.ask()
-    params = _suggest_bayes_params(trial)
+    params, duplicate_attempts = _suggest_unique_bayes_params(study, tried_param_keys)
     next_config = apply_bayes_params_to_config(previous_config, params)
     next_config["adaptive_metadata"] = {
         "adaptive_index": adaptive_index,
@@ -620,6 +636,7 @@ def _generate_bayes_config(previous_config, metrics, adaptive_index,
         "seed": seed,
         "history_trials": len(trials),
         "suggested_params": params,
+        "duplicate_suggestion_retries": duplicate_attempts,
         "previous_best": should_stop_bayes_early(trials),
         "reasons": ["suggested next configuration with Optuna TPE"],
     }

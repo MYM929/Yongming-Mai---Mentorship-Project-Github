@@ -38,7 +38,7 @@ $DatasetConfigs = Optional-Env "DATASET_CONFIGS" "dataset_1_bedroom.json,dataset
 $AdaptiveMode = Optional-Env "ADAPTIVE_MODE" "metric_conservative"
 if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable("EXPERIMENT_COUNT"))) {
     if ($AdaptiveMode -eq "bayes_opt") {
-        $ExperimentCount = "12"
+        $ExperimentCount = "24"
     } else {
         $ExperimentCount = "3"
     }
