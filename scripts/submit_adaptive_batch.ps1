@@ -35,8 +35,16 @@ $S3DatasetsUri = Require-Env "S3_DATASETS_URI"
 $S3OutputsUri = Require-Env "S3_OUTPUTS_URI"
 
 $DatasetConfigs = Optional-Env "DATASET_CONFIGS" "dataset_1_bedroom.json,dataset_2_meeting_room.json"
-$ExperimentCount = Optional-Env "EXPERIMENT_COUNT" "3"
 $AdaptiveMode = Optional-Env "ADAPTIVE_MODE" "metric_conservative"
+if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable("EXPERIMENT_COUNT"))) {
+    if ($AdaptiveMode -eq "bayes_opt") {
+        $ExperimentCount = "12"
+    } else {
+        $ExperimentCount = "3"
+    }
+} else {
+    $ExperimentCount = [Environment]::GetEnvironmentVariable("EXPERIMENT_COUNT")
+}
 $BatchRunId = Optional-Env "BATCH_RUN_ID" ([DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ"))
 
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pose-submit-" + [Guid]::NewGuid().ToString("N"))

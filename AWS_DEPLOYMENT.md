@@ -103,6 +103,15 @@ uses 70% quality and 30% speed, where quality includes accepted-frame ratio,
 segment count, head-tail drift, and loop-closure strength, and speed uses runtime
 per accepted frame.
 
+Set `ADAPTIVE_MODE=bayes_opt` to use Optuna TPE Bayesian optimization instead of
+the conservative one-step heuristic. In this mode `EXPERIMENT_COUNT` is treated
+as the maximum trial budget, defaulting to 12 in the submit scripts when it is
+not set. Each dataset optimizes independently, and the container may stop early
+after at least 5 trials when the best quality-first objective improves by less
+than 0.01 for 3 consecutive trials. The final report includes the actual number
+of experiments used, the objective score, constraint status, and early-stop
+reason.
+
 ## AWS Batch Setup
 
 The recommended Batch shape is one managed EC2 ARM64 compute environment, one
@@ -176,8 +185,8 @@ Defaults:
 
 ```text
 DATASET_CONFIGS=dataset_1_bedroom.json,dataset_2_meeting_room.json
-EXPERIMENT_COUNT=3
 ADAPTIVE_MODE=metric_conservative
+EXPERIMENT_COUNT=3 for metric_conservative, 12 for bayes_opt
 BATCH_RUN_ID=<UTC timestamp>
 ```
 
@@ -249,7 +258,7 @@ CONFIG_NAME
 Optional:
 
 ```text
-EXPERIMENT_COUNT=1
+EXPERIMENT_COUNT=1 for metric_conservative, 12 for bayes_opt
 BATCH_RUN_ID=<generated if not provided>
-ADAPTIVE_MODE=metric_conservative
+ADAPTIVE_MODE=metric_conservative or bayes_opt
 ```

@@ -9,8 +9,14 @@ set -euo pipefail
 : "${S3_OUTPUTS_URI:?Set S3_OUTPUTS_URI, for example s3://bucket/experiments}"
 
 DATASET_CONFIGS="${DATASET_CONFIGS:-dataset_1_bedroom.json,dataset_2_meeting_room.json}"
-EXPERIMENT_COUNT="${EXPERIMENT_COUNT:-3}"
 ADAPTIVE_MODE="${ADAPTIVE_MODE:-metric_conservative}"
+if [[ -z "${EXPERIMENT_COUNT:-}" ]]; then
+  if [[ "${ADAPTIVE_MODE}" == "bayes_opt" ]]; then
+    EXPERIMENT_COUNT="12"
+  else
+    EXPERIMENT_COUNT="3"
+  fi
+fi
 BATCH_RUN_ID="${BATCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 tmp_dir="$(mktemp -d)"

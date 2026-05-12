@@ -12,6 +12,14 @@ from urllib.parse import urlparse
 
 import boto3
 
+from scripts.generate_next_adaptive_config import (
+    BAYES_FAILED_SCORE,
+    BAYES_MODE,
+    evaluate_bayes_objective,
+    extract_bayes_params_from_config,
+    should_stop_bayes_early,
+)
+
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIGS_DIR = APP_DIR / "configs"
@@ -54,8 +62,8 @@ def _sanitize_token(value, name):
     return cleaned
 
 
-def _get_experiment_count():
-    value = os.environ.get("EXPERIMENT_COUNT", "1")
+def _get_experiment_count(default_value="1"):
+    value = os.environ.get("EXPERIMENT_COUNT", default_value)
     try:
         count = int(value)
     except ValueError as exc:
@@ -276,21 +284,48 @@ def _report_value(value, digits=3):
     return str(value)
 
 
-def _write_batch_report(dataset_name, batch_run_id, completed_runs):
+def _failed_scores():
+    return {
+        "quality_score": 0.0,
+        "speed_score": 0.0,
+        "balanced_score": BAYES_FAILED_SCORE,
+        "objective_score": BAYES_FAILED_SCORE,
+        "constraint_status": "failed_or_missing_metrics",
+    }
+
+
+def _write_batch_report(dataset_name, batch_run_id, completed_runs,
+                        adaptive_mode="metric_conservative",
+                        early_stop_info=None):
     report_dir = EXPERIMENTS_DIR / dataset_name / f"batch_report_{batch_run_id}"
     report_dir.mkdir(parents=True, exist_ok=True)
 
+    ranking_key = (
+        lambda item: item["scores"].get("objective_score", BAYES_FAILED_SCORE)
+        if adaptive_mode == BAYES_MODE
+        else item["scores"]["balanced_score"]
+    )
     ranked_runs = sorted(
         completed_runs,
-        key=lambda item: item["scores"]["balanced_score"],
+        key=ranking_key,
         reverse=True,
     )
     best = ranked_runs[0] if ranked_runs else None
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    early_stop_info = early_stop_info or {
+        "should_stop": False,
+        "reason": "not evaluated",
+        "trials_used": len(completed_runs),
+        "best_score": None,
+        "best_sequence_number": None,
+    }
     summary = {
         "dataset_name": dataset_name,
         "batch_run_id": batch_run_id,
+        "adaptive_mode": adaptive_mode,
         "generated_at": generated_at,
+        "actual_experiment_count": len(completed_runs),
+        "early_stopping": early_stop_info,
         "scoring": {
             "balanced_score": "quality_score * 0.7 + speed_score * 0.3",
             "quality_score": (
@@ -298,6 +333,10 @@ def _write_batch_report(dataset_name, batch_run_id, completed_runs):
                 "and loop-closure strength"
             ),
             "speed_score": "runtime per accepted frame; fast is <= 0.5 sec",
+            "objective_score": (
+                "quality-first Bayesian objective with hard penalties for "
+                "weak tracking, multiple segments, high drift, or high memory"
+            ),
         },
         "best_run": best,
         "runs": ranked_runs,
@@ -309,8 +348,11 @@ def _write_batch_report(dataset_name, batch_run_id, completed_runs):
         "sequence_number",
         "config_name",
         "balanced_score",
+        "objective_score",
         "quality_score",
         "speed_score",
+        "constraint_status",
+        "failed",
         "accepted_frame_ratio",
         "num_segments",
         "head_tail_translation_drift_m",
@@ -322,14 +364,18 @@ def _write_batch_report(dataset_name, batch_run_id, completed_runs):
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         handle.write(",".join(csv_fields) + "\n")
         for rank, run in enumerate(ranked_runs, start=1):
-            metrics = run["metrics"]
+            metrics = run.get("metrics") or {}
+            scores = run["scores"]
             row = {
                 "rank": rank,
                 "sequence_number": run["sequence_number"],
                 "config_name": run["config_name"],
-                "balanced_score": run["scores"]["balanced_score"],
-                "quality_score": run["scores"]["quality_score"],
-                "speed_score": run["scores"]["speed_score"],
+                "balanced_score": scores.get("balanced_score"),
+                "objective_score": scores.get("objective_score"),
+                "quality_score": scores.get("quality_score"),
+                "speed_score": scores.get("speed_score"),
+                "constraint_status": scores.get("constraint_status"),
+                "failed": run.get("failed", False),
                 "accepted_frame_ratio": metrics.get("accepted_frame_ratio"),
                 "num_segments": metrics.get("num_segments"),
                 "head_tail_translation_drift_m": metrics.get(
@@ -358,22 +404,27 @@ def _write_batch_report(dataset_name, batch_run_id, completed_runs):
         ])
     md_lines.extend([
         "",
+        f"- Adaptive mode: {adaptive_mode}",
         "Scoring balances quality and speed: 70% quality, 30% speed.",
+        f"- Actual experiments used: {len(completed_runs)}",
+        f"- Early stopping: {early_stop_info.get('reason')}",
         "",
-        "| Rank | Run | Config | Balanced | Quality | Speed | Accepted | Segments | Drift m | Sec/frame | Overall |",
-        "|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| Rank | Run | Config | Objective | Balanced | Quality | Speed | Constraints | Accepted | Segments | Drift m | Sec/frame | Overall |",
+        "|---:|---:|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---|",
     ])
     for rank, run in enumerate(ranked_runs, start=1):
-        metrics = run["metrics"]
+        metrics = run.get("metrics") or {}
         scores = run["scores"]
         md_lines.append(
             "| "
             f"{rank} | "
             f"{run['sequence_number']} | "
             f"{run['config_name']} | "
-            f"{scores['balanced_score']:.4f} | "
-            f"{scores['quality_score']:.4f} | "
-            f"{scores['speed_score']:.4f} | "
+            f"{_report_value(scores.get('objective_score'))} | "
+            f"{_report_value(scores.get('balanced_score'))} | "
+            f"{_report_value(scores.get('quality_score'))} | "
+            f"{_report_value(scores.get('speed_score'))} | "
+            f"{scores.get('constraint_status', 'N/A')} | "
             f"{_report_value(metrics.get('accepted_frame_ratio'))} | "
             f"{_report_value(metrics.get('num_segments'), 0)} | "
             f"{_report_value(metrics.get('head_tail_translation_drift_m'))} | "
@@ -396,7 +447,8 @@ def _upload_batch_report(s3, outputs_uri, dataset_name, batch_run_id, report_dir
 
 
 def _generate_adaptive_config(previous_config_path, metrics_path, dataset_name,
-                              adaptive_index, mode, batch_run_id):
+                              adaptive_index, mode, batch_run_id,
+                              trial_history_path=None):
     if not ADAPTIVE_CONFIG_SCRIPT.exists():
         raise FileNotFoundError(
             f"Adaptive config generator not found: {ADAPTIVE_CONFIG_SCRIPT}"
@@ -417,7 +469,13 @@ def _generate_adaptive_config(previous_config_path, metrics_path, dataset_name,
         str(adaptive_index),
         "--mode",
         mode,
+        "--dataset-name",
+        dataset_name,
+        "--batch-run-id",
+        batch_run_id,
     ]
+    if trial_history_path is not None:
+        command.extend(["--trial-history", str(trial_history_path)])
     result = subprocess.run(command, cwd=str(APP_DIR), check=False)
     if result.returncode != 0:
         raise SystemExit(result.returncode)
@@ -430,9 +488,17 @@ def _run_adaptive_sequence(s3, configs_uri, outputs_uri, dataset_name,
     current_config_path = initial_config_path
     completed_runs = 0
     completed_run_records = []
+    early_stop_info = None
+    trial_history_path = (
+        CONFIGS_DIR / "adaptive" / batch_run_id / f"{dataset_name}_bayes_trials.json"
+        if adaptive_mode == BAYES_MODE
+        else None
+    )
 
     for sequence_number in range(1, experiment_count + 1):
         current_config_name = current_config_path.name
+        with current_config_path.open("r", encoding="utf-8") as handle:
+            current_config = json.load(handle)
         print(
             f"Running experiment {sequence_number}/{experiment_count} "
             f"for dataset '{dataset_name}' with {current_config_name}..."
@@ -443,10 +509,11 @@ def _run_adaptive_sequence(s3, configs_uri, outputs_uri, dataset_name,
         new_runs = [path for path in after_runs if path not in before_runs]
         local_run_dir = new_runs[-1] if new_runs else (after_runs[-1] if after_runs else None)
         metrics_path = None
+        metrics = None
+        scores = None
+        failed = returncode != 0
 
         if local_run_dir is not None:
-            metrics = None
-            scores = None
             try:
                 metrics_path = _latest_metrics_json(local_run_dir)
                 with metrics_path.open("r", encoding="utf-8") as handle:
@@ -454,6 +521,17 @@ def _run_adaptive_sequence(s3, configs_uri, outputs_uri, dataset_name,
                 scores = _score_run(metrics)
             except FileNotFoundError as exc:
                 print(f"No metrics report found for run{sequence_number}: {exc}")
+                scores = _failed_scores()
+                failed = True
+            if adaptive_mode == BAYES_MODE:
+                bayes_scores = evaluate_bayes_objective(
+                    metrics,
+                    current_config["pose_tracking"],
+                )
+                if scores is None:
+                    scores = _failed_scores()
+                scores.update(bayes_scores)
+                failed = failed or metrics is None
             shutil.copy2(current_config_path, local_run_dir / "used_config.json")
             _write_json(local_run_dir / "run_manifest.json", {
                 "dataset_name": dataset_name,
@@ -463,6 +541,8 @@ def _run_adaptive_sequence(s3, configs_uri, outputs_uri, dataset_name,
                 "config_path": str(current_config_path),
                 "metrics_file": metrics_path.name if metrics_path else None,
                 "scores": scores,
+                "adaptive_metadata": current_config.get("adaptive_metadata"),
+                "failed": failed,
             })
             if metrics is not None and scores is not None:
                 completed_run_records.append({
@@ -472,6 +552,19 @@ def _run_adaptive_sequence(s3, configs_uri, outputs_uri, dataset_name,
                     "metrics_file": metrics_path.name,
                     "metrics": metrics,
                     "scores": scores,
+                    "adaptive_metadata": current_config.get("adaptive_metadata"),
+                    "failed": failed,
+                })
+            elif adaptive_mode == BAYES_MODE:
+                completed_run_records.append({
+                    "sequence_number": sequence_number,
+                    "config_name": current_config_name,
+                    "local_run_dir": str(local_run_dir),
+                    "metrics_file": None,
+                    "metrics": {},
+                    "scores": scores or _failed_scores(),
+                    "adaptive_metadata": current_config.get("adaptive_metadata"),
+                    "failed": True,
                 })
             _upload_sequence_run(
                 s3,
@@ -484,32 +577,79 @@ def _run_adaptive_sequence(s3, configs_uri, outputs_uri, dataset_name,
             completed_runs += 1
         else:
             print("No local run directory was created before process exit.")
+            if adaptive_mode == BAYES_MODE:
+                scores = _failed_scores()
+                completed_run_records.append({
+                    "sequence_number": sequence_number,
+                    "config_name": current_config_name,
+                    "local_run_dir": None,
+                    "metrics_file": None,
+                    "metrics": {},
+                    "scores": scores,
+                    "adaptive_metadata": current_config.get("adaptive_metadata"),
+                    "failed": True,
+                })
 
-        if returncode != 0:
+        if returncode != 0 and adaptive_mode != BAYES_MODE:
             print(
                 f"Experiment {sequence_number} failed with exit code {returncode}; "
                 f"uploaded {completed_runs} completed/partial run folder(s)."
             )
             raise SystemExit(returncode)
-        if local_run_dir is None:
+        if returncode != 0:
+            print(
+                f"Experiment {sequence_number} failed with exit code {returncode}; "
+                "recorded as a poor Bayesian trial and continuing."
+            )
+        if local_run_dir is None and adaptive_mode != BAYES_MODE:
             raise RuntimeError(
                 f"Experiment {sequence_number} completed without a run directory"
             )
-        if metrics_path is None:
+        if metrics_path is None and adaptive_mode != BAYES_MODE:
             raise RuntimeError(
                 f"Experiment {sequence_number} completed without a metrics report"
             )
 
+        if adaptive_mode == BAYES_MODE:
+            for record in completed_run_records:
+                if "params" not in record:
+                    record["params"] = extract_bayes_params_from_config(current_config)
+                if "objective_score" not in record:
+                    record["objective_score"] = record["scores"].get(
+                        "objective_score", BAYES_FAILED_SCORE
+                    )
+                    record["constraint_status"] = record["scores"].get(
+                        "constraint_status", "unknown"
+                    )
+                    record["quality_score"] = record["scores"].get("quality_score")
+                    record["speed_score"] = record["scores"].get("speed_score")
+            _write_json(trial_history_path, {"trials": completed_run_records})
+            early_stop_info = should_stop_bayes_early(completed_run_records)
+            if early_stop_info.get("should_stop"):
+                print(
+                    f"Stopping Bayesian optimization after {sequence_number} "
+                    f"trial(s): {early_stop_info['reason']}"
+                )
+                break
+
         if sequence_number == experiment_count:
             break
 
+        generation_metrics_path = metrics_path
+        if generation_metrics_path is None:
+            generation_metrics_path = (
+                CONFIGS_DIR / "adaptive" / batch_run_id
+                / f"{dataset_name}_failed_metrics_{sequence_number:02d}.json"
+            )
+            _write_json(generation_metrics_path, {})
         next_config_path, next_config_name = _generate_adaptive_config(
             current_config_path,
-            metrics_path,
+            generation_metrics_path,
             dataset_name,
             sequence_number,
             adaptive_mode,
             batch_run_id,
+            trial_history_path=trial_history_path,
         )
         config_target = S3Uri(
             bucket=configs_uri.bucket,
@@ -525,7 +665,11 @@ def _run_adaptive_sequence(s3, configs_uri, outputs_uri, dataset_name,
 
     if completed_run_records:
         report_dir = _write_batch_report(
-            dataset_name, batch_run_id, completed_run_records
+            dataset_name,
+            batch_run_id,
+            completed_run_records,
+            adaptive_mode=adaptive_mode,
+            early_stop_info=early_stop_info,
         )
         _upload_batch_report(s3, outputs_uri, dataset_name, batch_run_id, report_dir)
 
@@ -535,9 +679,11 @@ def main():
     configs_uri = _parse_s3_uri(_get_required_env("S3_CONFIGS_URI"))
     datasets_uri = _parse_s3_uri(_get_required_env("S3_DATASETS_URI"))
     outputs_uri = _parse_s3_uri(_get_required_env("S3_OUTPUTS_URI"))
-    config_name = os.environ.get("CONFIG_NAME", DEFAULT_CONFIG_NAME)
-    experiment_count = _get_experiment_count()
     adaptive_mode = os.environ.get("ADAPTIVE_MODE", "metric_conservative")
+    config_name = os.environ.get("CONFIG_NAME", DEFAULT_CONFIG_NAME)
+    experiment_count = _get_experiment_count(
+        "12" if adaptive_mode == BAYES_MODE else "1"
+    )
     batch_run_id_value = os.environ.get("BATCH_RUN_ID")
     batch_run_id = (
         _sanitize_token(batch_run_id_value, "BATCH_RUN_ID")
