@@ -1,0 +1,163 @@
+{
+  "dataset_name": "dataset_2_meeting_room",
+  "dataset_dir": "datasets/dataset_2_meeting_room",
+  "pose_tracking": {
+    "input": {
+      "frame_pair_max_time_diff_sec": 0.02
+    },
+    "imu": {
+      "max_sample_gap_sec": 0.1,
+      "min_rotation_angle_rad": 1e-8
+    },
+    "jetson": {
+      "cores": 6,
+      "ram_limit_mb": 5500,
+      "ram_warn_mb": 4000
+    },
+    "camera": {
+      "width": 1280,
+      "height": 720,
+      "fx": 613.584,
+      "fy": 613.542,
+      "cx": 644.171,
+      "cy": 355.251
+    },
+    "odometry": {
+      "scale": 0.25,
+      "fast_iterations": [6, 4, 3],
+      "full_iterations": [10, 5, 3]
+    },
+    "depth": {
+      "scale": 1000.0,
+      "max_depth": 3.0,
+      "min_depth": 0.1,
+      "max_depth_diff": 0.07
+    },
+    "motion_validation": {
+      "max_velocity_mps": 0.5,
+      "max_angular_velocity_rps": 2.5,
+      "min_dt_sec": 0.005
+    },
+    "segmentation": {
+      "max_consecutive_skip": 8,
+      "recovery_backtrack_frames": 3
+    },
+    "local_loop_closure": {
+      "stride": 6,
+      "gaps": [3],
+      "full_accept_min_frames_for_single_gap": 600
+    },
+    "orb_global_loop_closure": {
+      "min_interval": 20,
+      "features_per_frame": 500,
+      "match_ratio": 0.8,
+      "min_matches": 15,
+      "min_inliers": 8,
+      "ransac_threshold": 4.0,
+      "query_stride": 12,
+      "max_candidates": 2,
+      "max_translation_m": 2.0,
+      "max_rotation_rad": 1.5,
+      "prescreen_top_k": 20,
+      "fast_only_odometry": true
+    },
+    "pnp_initial_guess": {
+      "min_points": 6,
+      "reprojection_error": 3.0,
+      "iterations": 300
+    },
+    "sequential_icp_fallback": {
+      "enabled": true,
+      "voxel_stages": [
+        [0.05, 0.15, 20],
+        [0.03, 0.08, 15]
+      ],
+      "fitness_min": 0.3,
+      "max_translation_m": 0.8,
+      "max_rotation_rad": 1.2,
+      "information_scale": 8000,
+      "information_min": 400
+    },
+    "icp_loop_verification": {
+      "fitness_min": 0.15,
+      "voxel_stages": [
+        [0.08, 0.4, 20],
+        [0.04, 0.15, 12]
+      ],
+      "information_scale": 10000,
+      "information_min": 500
+    },
+    "fpfh_global_loop_closure": {
+      "enabled": true,
+      "voxel_size": 0.1,
+      "radius_normal": 0.2,
+      "radius_feature": 0.4,
+      "query_stride": 30,
+      "ransac_distance": 0.06,
+      "fitness_min": 0.2,
+      "max_candidates": 2,
+      "spatial_max_distance_m": 2.5,
+      "spatial_top_k": 20,
+      "skip_odometry_refine": true,
+      "orb_backfill_only": true,
+      "min_points": 50,
+      "normal_max_nn": 30,
+      "feature_max_nn": 100,
+      "ransac_edge_length": 0.9,
+      "ransac_n": 3,
+      "ransac_max_iterations": 2500,
+      "ransac_legacy_max_iterations": 8000,
+      "ransac_confidence": 0.999
+    },
+    "point_cloud": {
+      "level_min_points": 50,
+      "normal_radius_multiplier": 4.0,
+      "normal_max_nn": 30
+    },
+    "head_tail_loop_closure": {
+      "node_count": 6,
+      "stride": 3
+    },
+    "pose_graph_optimization": {
+      "passes": [
+        {
+          "name": "coarse",
+          "max_correspondence_distance": 0.1,
+          "edge_prune_threshold": 0.25,
+          "reference_node": 0
+        },
+        {
+          "name": "fine",
+          "max_correspondence_distance": 0.03,
+          "edge_prune_threshold": 0.25,
+          "reference_node": 0
+        }
+      ]
+    },
+    "quality_judgment": {
+      "excellent_accepted_ratio": 0.95,
+      "good_accepted_ratio": 0.85,
+      "excellent_requires_single_segment": true,
+      "low_drift_m": 0.1,
+      "medium_drift_m": 0.3,
+      "fast_runtime_per_frame_sec": 0.5,
+      "moderate_runtime_per_frame_sec": 2.0
+    },
+    "workers": {
+      "io": 3,
+      "odometry": 2,
+      "fpfh": 2,
+      "global_loop_closure": 2
+    },
+    "caches": {
+      "rgbd": 50,
+      "pcd": 40,
+      "pcd_level": 80,
+      "pnp_depth": 15
+    },
+    "logging": {
+      "verbose_global_edge_log": false,
+      "global_edge_log_limit": 120
+    }
+  }
+}

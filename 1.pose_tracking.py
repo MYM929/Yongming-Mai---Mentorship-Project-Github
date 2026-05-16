@@ -35,10 +35,10 @@ Run AFTER  1.make_file_lists.py
 Run BEFORE 3.build_pointcloud.py
 """
 
-import argparse
 import open3d as o3d
 import numpy as np
 import cv2
+import csv
 import json
 import math
 import os
@@ -47,87 +47,213 @@ import time
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+from experiment_config import create_next_run_dir, load_dataset_config
 
 try:
     cv2.setNumThreads(1)
 except Exception:
     pass
 
-# ====================== Jetson Nano Super Simulation ======================
-JETSON_CORES = 6
-JETSON_RAM_LIMIT_MB = 5500
-JETSON_RAM_WARN_MB = 4000
-
 # ====================== Configuration (Jetson-tuned) ======================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.path.join(SCRIPT_DIR, "dataset")
+PROJECT_CONFIG = load_dataset_config()
+ACTIVE_DATASET = PROJECT_CONFIG["dataset_name"]
+BASE_DIR = PROJECT_CONFIG["dataset_dir"]
+DATASET_EXPERIMENTS_DIR = PROJECT_CONFIG["dataset_experiments_dir"]
+RAW_CONFIG = PROJECT_CONFIG["raw_config"]
 
-# Camera intrinsics (full resolution)
-WIDTH, HEIGHT = 1280, 720
-FX, FY = 613.584, 613.542
-CX, CY = 644.171, 355.251
+if "pose_tracking" not in RAW_CONFIG:
+    raise ValueError(
+        f"'pose_tracking' is missing from {PROJECT_CONFIG['config_path']}"
+    )
 
-# ---- Quarter-resolution for ALL odometry (Jetson) ----
-ODO_SCALE = 0.25
-ODO_W = int(WIDTH * ODO_SCALE)    # 320
-ODO_H = int(HEIGHT * ODO_SCALE)   # 180
+POSE_TRACKING_CONFIG = RAW_CONFIG["pose_tracking"]
 
-# Depth
-DEPTH_SCALE = 1000.0
-MAX_DEPTH   = 3.0
-MIN_DEPTH   = 0.1
-MAX_DEPTH_DIFF = 0.07
 
-# Motion validation
-MAX_VELOCITY    = 0.5    # m/s
-MAX_ANGULAR_VEL = 2.5    # rad/s
+def _pose_cfg(*path):
+    value = POSE_TRACKING_CONFIG
+    for key in path:
+        value = value[key]
+    return value
 
-# Segment detection
-MAX_CONSECUTIVE_SKIP = 8
 
-# ---- Local loop closures (reduced for Jetson) ----
-LC_STRIDE = 6
-LC_GAPS   = [3]
+def _stage_tuples(stages):
+    return [(float(vs), float(max_d), int(max_it))
+            for vs, max_d, max_it in stages]
+
 
 # ---- Global Loop Closure – ORB (reduced for Jetson) ----
-GLC_MIN_INTERVAL    = 20
-GLC_ORB_FEATURES    = 500
-GLC_MATCH_RATIO     = 0.80
-GLC_MIN_MATCHES     = 15
-GLC_MIN_INLIERS     = 8
-GLC_RANSAC_THRESH   = 4.0
-GLC_QUERY_STRIDE    = 12
-GLC_MAX_CANDIDATES  = 2
-GLC_MAX_TRANSLATION = 2.0
-GLC_MAX_ROTATION    = 1.5
-GLC_ORB_PRESCREEN_K = 20
-GLC_FAST_ONLY_ODO   = True
+JETSON_CORES = int(_pose_cfg("jetson", "cores"))
+JETSON_RAM_LIMIT_MB = int(_pose_cfg("jetson", "ram_limit_mb"))
+JETSON_RAM_WARN_MB = int(_pose_cfg("jetson", "ram_warn_mb"))
 
-# ---- ICP verification ----
-GLC_ICP_FITNESS_MIN = 0.15
-GLC_HEAD_TAIL_N     = 6
+FRAME_PAIR_MAX_TIME_DIFF = float(_pose_cfg(
+    "input", "frame_pair_max_time_diff_sec"))
+IMU_MAX_SAMPLE_GAP = float(_pose_cfg("imu", "max_sample_gap_sec"))
+IMU_MIN_ROTATION_ANGLE = float(_pose_cfg("imu", "min_rotation_angle_rad"))
 
-# ---- Depth-ICP sequential fallback (fewer iterations for Jetson) ----
-DEPTH_ICP_FALLBACK = True
-ICP_SEQ_VOXELS = [
-    (0.05, 0.15, 20),
-    (0.03, 0.08, 15),
+WIDTH = int(_pose_cfg("camera", "width"))
+HEIGHT = int(_pose_cfg("camera", "height"))
+FX = float(_pose_cfg("camera", "fx"))
+FY = float(_pose_cfg("camera", "fy"))
+CX = float(_pose_cfg("camera", "cx"))
+CY = float(_pose_cfg("camera", "cy"))
+
+ODO_SCALE = float(_pose_cfg("odometry", "scale"))
+ODO_W = int(WIDTH * ODO_SCALE)
+ODO_H = int(HEIGHT * ODO_SCALE)
+ODO_FAST_ITERATIONS = [
+    int(v) for v in _pose_cfg("odometry", "fast_iterations")]
+ODO_FULL_ITERATIONS = [
+    int(v) for v in _pose_cfg("odometry", "full_iterations")]
+
+DEPTH_SCALE = float(_pose_cfg("depth", "scale"))
+MAX_DEPTH = float(_pose_cfg("depth", "max_depth"))
+MIN_DEPTH = float(_pose_cfg("depth", "min_depth"))
+MAX_DEPTH_DIFF = float(_pose_cfg("depth", "max_depth_diff"))
+
+MAX_VELOCITY = float(_pose_cfg("motion_validation", "max_velocity_mps"))
+MAX_ANGULAR_VEL = float(_pose_cfg(
+    "motion_validation", "max_angular_velocity_rps"))
+MOTION_MIN_DT = float(_pose_cfg("motion_validation", "min_dt_sec"))
+
+MAX_CONSECUTIVE_SKIP = int(_pose_cfg(
+    "segmentation", "max_consecutive_skip"))
+RECOVERY_BACKTRACK_FRAMES = int(_pose_cfg(
+    "segmentation", "recovery_backtrack_frames"))
+
+LC_STRIDE = int(_pose_cfg("local_loop_closure", "stride"))
+LC_GAPS = [int(v) for v in _pose_cfg("local_loop_closure", "gaps")]
+LC_FULL_ACCEPT_MIN_FRAMES = int(_pose_cfg(
+    "local_loop_closure", "full_accept_min_frames_for_single_gap"))
+
+GLC_MIN_INTERVAL = int(_pose_cfg(
+    "orb_global_loop_closure", "min_interval"))
+GLC_ORB_FEATURES = int(_pose_cfg(
+    "orb_global_loop_closure", "features_per_frame"))
+GLC_MATCH_RATIO = float(_pose_cfg(
+    "orb_global_loop_closure", "match_ratio"))
+GLC_MIN_MATCHES = int(_pose_cfg(
+    "orb_global_loop_closure", "min_matches"))
+GLC_MIN_INLIERS = int(_pose_cfg(
+    "orb_global_loop_closure", "min_inliers"))
+GLC_RANSAC_THRESH = float(_pose_cfg(
+    "orb_global_loop_closure", "ransac_threshold"))
+GLC_QUERY_STRIDE = int(_pose_cfg(
+    "orb_global_loop_closure", "query_stride"))
+GLC_MAX_CANDIDATES = int(_pose_cfg(
+    "orb_global_loop_closure", "max_candidates"))
+GLC_MAX_TRANSLATION = float(_pose_cfg(
+    "orb_global_loop_closure", "max_translation_m"))
+GLC_MAX_ROTATION = float(_pose_cfg(
+    "orb_global_loop_closure", "max_rotation_rad"))
+GLC_ORB_PRESCREEN_K = int(_pose_cfg(
+    "orb_global_loop_closure", "prescreen_top_k"))
+GLC_FAST_ONLY_ODO = bool(_pose_cfg(
+    "orb_global_loop_closure", "fast_only_odometry"))
+
+PNP_MIN_POINTS = int(_pose_cfg("pnp_initial_guess", "min_points"))
+PNP_REPROJECTION_ERROR = float(_pose_cfg(
+    "pnp_initial_guess", "reprojection_error"))
+PNP_ITERATIONS = int(_pose_cfg("pnp_initial_guess", "iterations"))
+
+GLC_ICP_FITNESS_MIN = float(_pose_cfg(
+    "icp_loop_verification", "fitness_min"))
+GLC_ICP_VOXELS = _stage_tuples(_pose_cfg(
+    "icp_loop_verification", "voxel_stages"))
+GLC_ICP_INFO_SCALE = float(_pose_cfg(
+    "icp_loop_verification", "information_scale"))
+GLC_ICP_INFO_MIN = float(_pose_cfg(
+    "icp_loop_verification", "information_min"))
+
+DEPTH_ICP_FALLBACK = bool(_pose_cfg(
+    "sequential_icp_fallback", "enabled"))
+ICP_SEQ_VOXELS = _stage_tuples(_pose_cfg(
+    "sequential_icp_fallback", "voxel_stages"))
+ICP_SEQ_FITNESS_MIN = float(_pose_cfg(
+    "sequential_icp_fallback", "fitness_min"))
+ICP_SEQ_MAX_TRANSLATION = float(_pose_cfg(
+    "sequential_icp_fallback", "max_translation_m"))
+ICP_SEQ_MAX_ROTATION = float(_pose_cfg(
+    "sequential_icp_fallback", "max_rotation_rad"))
+ICP_SEQ_INFO_SCALE = float(_pose_cfg(
+    "sequential_icp_fallback", "information_scale"))
+ICP_SEQ_INFO_MIN = float(_pose_cfg(
+    "sequential_icp_fallback", "information_min"))
+
+GLC_FPFH_ENABLED = bool(_pose_cfg(
+    "fpfh_global_loop_closure", "enabled"))
+GLC_FPFH_VOXEL = float(_pose_cfg(
+    "fpfh_global_loop_closure", "voxel_size"))
+GLC_FPFH_RADIUS_NORMAL = float(_pose_cfg(
+    "fpfh_global_loop_closure", "radius_normal"))
+GLC_FPFH_RADIUS_FEAT = float(_pose_cfg(
+    "fpfh_global_loop_closure", "radius_feature"))
+GLC_FPFH_QUERY_STRIDE = int(_pose_cfg(
+    "fpfh_global_loop_closure", "query_stride"))
+GLC_FPFH_RANSAC_DIST = float(_pose_cfg(
+    "fpfh_global_loop_closure", "ransac_distance"))
+GLC_FPFH_FITNESS_MIN = float(_pose_cfg(
+    "fpfh_global_loop_closure", "fitness_min"))
+GLC_FPFH_MAX_CANDIDATES = int(_pose_cfg(
+    "fpfh_global_loop_closure", "max_candidates"))
+GLC_FPFH_SPATIAL_MAX_DIST = float(_pose_cfg(
+    "fpfh_global_loop_closure", "spatial_max_distance_m"))
+GLC_FPFH_SPATIAL_TOPK = int(_pose_cfg(
+    "fpfh_global_loop_closure", "spatial_top_k"))
+GLC_FPFH_SKIP_ODO_REFINE = bool(_pose_cfg(
+    "fpfh_global_loop_closure", "skip_odometry_refine"))
+GLC_FPFH_ORB_BACKFILL_ONLY = bool(_pose_cfg(
+    "fpfh_global_loop_closure", "orb_backfill_only"))
+GLC_FPFH_MIN_POINTS = int(_pose_cfg(
+    "fpfh_global_loop_closure", "min_points"))
+GLC_FPFH_NORMAL_MAX_NN = int(_pose_cfg(
+    "fpfh_global_loop_closure", "normal_max_nn"))
+GLC_FPFH_FEATURE_MAX_NN = int(_pose_cfg(
+    "fpfh_global_loop_closure", "feature_max_nn"))
+GLC_FPFH_RANSAC_EDGE_LENGTH = float(_pose_cfg(
+    "fpfh_global_loop_closure", "ransac_edge_length"))
+GLC_FPFH_RANSAC_N = int(_pose_cfg(
+    "fpfh_global_loop_closure", "ransac_n"))
+GLC_FPFH_RANSAC_MAX_ITER = int(_pose_cfg(
+    "fpfh_global_loop_closure", "ransac_max_iterations"))
+GLC_FPFH_RANSAC_LEGACY_MAX_ITER = int(_pose_cfg(
+    "fpfh_global_loop_closure", "ransac_legacy_max_iterations"))
+GLC_FPFH_RANSAC_CONFIDENCE = float(_pose_cfg(
+    "fpfh_global_loop_closure", "ransac_confidence"))
+
+PCD_LEVEL_MIN_POINTS = int(_pose_cfg("point_cloud", "level_min_points"))
+PCD_NORMAL_RADIUS_MULTIPLIER = float(_pose_cfg(
+    "point_cloud", "normal_radius_multiplier"))
+PCD_NORMAL_MAX_NN = int(_pose_cfg("point_cloud", "normal_max_nn"))
+
+GLC_HEAD_TAIL_N = int(_pose_cfg("head_tail_loop_closure", "node_count"))
+GLC_HEAD_TAIL_STRIDE = int(_pose_cfg("head_tail_loop_closure", "stride"))
+
+PGO_PASSES = [
+    {
+        "name": str(p.get("name", f"pass_{idx + 1}")),
+        "max_correspondence_distance": float(p["max_correspondence_distance"]),
+        "edge_prune_threshold": float(p["edge_prune_threshold"]),
+        "reference_node": int(p.get("reference_node", 0)),
+    }
+    for idx, p in enumerate(_pose_cfg("pose_graph_optimization", "passes"))
 ]
-ICP_SEQ_FITNESS_MIN = 0.30
 
-# ---- FPFH geometric loop closure (coarser for Jetson) ----
-GLC_FPFH_ENABLED          = True
-GLC_FPFH_VOXEL            = 0.10
-GLC_FPFH_RADIUS_NORMAL    = 0.20
-GLC_FPFH_RADIUS_FEAT      = 0.40
-GLC_FPFH_QUERY_STRIDE     = 30
-GLC_FPFH_RANSAC_DIST      = 0.06
-GLC_FPFH_FITNESS_MIN      = 0.20
-GLC_FPFH_MAX_CANDIDATES   = 2
-GLC_FPFH_SPATIAL_MAX_DIST = 2.5
-GLC_FPFH_SPATIAL_TOPK     = 20
-GLC_FPFH_SKIP_ODO_REFINE  = True
-GLC_FPFH_ORB_BACKFILL_ONLY = True
+QJ_ACCEPTED_EXCELLENT = float(_pose_cfg(
+    "quality_judgment", "excellent_accepted_ratio"))
+QJ_ACCEPTED_GOOD = float(_pose_cfg(
+    "quality_judgment", "good_accepted_ratio"))
+QJ_EXCELLENT_REQUIRES_SINGLE_SEGMENT = bool(_pose_cfg(
+    "quality_judgment", "excellent_requires_single_segment"))
+QJ_DRIFT_LOW_M = float(_pose_cfg("quality_judgment", "low_drift_m"))
+QJ_DRIFT_MEDIUM_M = float(_pose_cfg("quality_judgment", "medium_drift_m"))
+QJ_RUNTIME_FAST_SEC = float(_pose_cfg(
+    "quality_judgment", "fast_runtime_per_frame_sec"))
+QJ_RUNTIME_MODERATE_SEC = float(_pose_cfg(
+    "quality_judgment", "moderate_runtime_per_frame_sec"))
 
 # Output / calibration paths
 TRAJ_FILE = os.path.join(BASE_DIR, "pose_trajectory.txt")
@@ -135,89 +261,25 @@ RGB_INTRINSICS_JSON = os.path.join(BASE_DIR, "calib", "rgb_intrinsics.json")
 IMU_CSV = os.path.join(BASE_DIR, "imu", "data.csv")
 
 # ---- Jetson-class worker & cache limits ----
-CPU_COUNT    = min(os.cpu_count() or 4, JETSON_CORES)
-IO_WORKERS   = min(3, CPU_COUNT)
-ODO_WORKERS  = 2
-FPFH_WORKERS = 2
-GLC_WORKERS  = 2
+CPU_COUNT = min(os.cpu_count() or 4, JETSON_CORES)
+IO_WORKERS = min(int(_pose_cfg("workers", "io")), CPU_COUNT)
+ODO_WORKERS = int(_pose_cfg("workers", "odometry"))
+FPFH_WORKERS = int(_pose_cfg("workers", "fpfh"))
+GLC_WORKERS = int(_pose_cfg("workers", "global_loop_closure"))
 
-RGBD_CACHE_SIZE      = 50
-PCD_CACHE_SIZE       = 40
-PCD_LEVEL_CACHE_SIZE = 80
-PNP_DEPTH_CACHE_SIZE = 15
+RGBD_CACHE_SIZE = int(_pose_cfg("caches", "rgbd"))
+PCD_CACHE_SIZE = int(_pose_cfg("caches", "pcd"))
+PCD_LEVEL_CACHE_SIZE = int(_pose_cfg("caches", "pcd_level"))
+PNP_DEPTH_CACHE_SIZE = int(_pose_cfg("caches", "pnp_depth"))
 
-VERBOSE_GLOBAL_EDGE_LOG = False
-GLOBAL_EDGE_LOG_LIMIT   = 120
+VERBOSE_GLOBAL_EDGE_LOG = bool(_pose_cfg(
+    "logging", "verbose_global_edge_log"))
+GLOBAL_EDGE_LOG_LIMIT = int(_pose_cfg("logging", "global_edge_log_limit"))
 
 # Reused constants
 EYE4    = np.eye(4)
 ZERO66  = np.zeros((6, 6))
 K_RGB_64 = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]], dtype=np.float64)
-
-# ====================== Externalizable parameter keys ======================
-CONFIGURABLE_KEYS = [
-    "JETSON_CORES", "JETSON_RAM_LIMIT_MB", "JETSON_RAM_WARN_MB",
-    "WIDTH", "HEIGHT", "FX", "FY", "CX", "CY",
-    "ODO_SCALE",
-    "DEPTH_SCALE", "MAX_DEPTH", "MIN_DEPTH", "MAX_DEPTH_DIFF",
-    "MAX_VELOCITY", "MAX_ANGULAR_VEL",
-    "MAX_CONSECUTIVE_SKIP",
-    "LC_STRIDE", "LC_GAPS",
-    "GLC_MIN_INTERVAL", "GLC_ORB_FEATURES", "GLC_MATCH_RATIO",
-    "GLC_MIN_MATCHES", "GLC_MIN_INLIERS", "GLC_RANSAC_THRESH",
-    "GLC_QUERY_STRIDE", "GLC_MAX_CANDIDATES", "GLC_MAX_TRANSLATION",
-    "GLC_MAX_ROTATION", "GLC_ORB_PRESCREEN_K", "GLC_FAST_ONLY_ODO",
-    "GLC_ICP_FITNESS_MIN", "GLC_HEAD_TAIL_N",
-    "DEPTH_ICP_FALLBACK", "ICP_SEQ_VOXELS", "ICP_SEQ_FITNESS_MIN",
-    "GLC_FPFH_ENABLED", "GLC_FPFH_VOXEL", "GLC_FPFH_RADIUS_NORMAL",
-    "GLC_FPFH_RADIUS_FEAT", "GLC_FPFH_QUERY_STRIDE", "GLC_FPFH_RANSAC_DIST",
-    "GLC_FPFH_FITNESS_MIN", "GLC_FPFH_MAX_CANDIDATES",
-    "GLC_FPFH_SPATIAL_MAX_DIST", "GLC_FPFH_SPATIAL_TOPK",
-    "GLC_FPFH_SKIP_ODO_REFINE", "GLC_FPFH_ORB_BACKFILL_ONLY",
-    "IO_WORKERS", "ODO_WORKERS", "FPFH_WORKERS", "GLC_WORKERS",
-    "RGBD_CACHE_SIZE", "PCD_CACHE_SIZE", "PCD_LEVEL_CACHE_SIZE",
-    "PNP_DEPTH_CACHE_SIZE",
-    "VERBOSE_GLOBAL_EDGE_LOG", "GLOBAL_EDGE_LOG_LIMIT",
-]
-
-
-def load_config(config_path):
-    """Load a JSON config and override matching module-level constants.
-
-    Returns the raw config dict (for echoing into metrics).
-    Only keys listed in CONFIGURABLE_KEYS are applied; unknown keys
-    are warned about but otherwise ignored.
-    """
-    with open(config_path) as f:
-        cfg = json.load(f)
-    g = globals()
-    unknown = [k for k in cfg if k not in CONFIGURABLE_KEYS]
-    if unknown:
-        print(f"Warning: unknown config keys ignored: {unknown}")
-    for k in CONFIGURABLE_KEYS:
-        if k in cfg:
-            g[k] = cfg[k]
-    # Recompute derived constants that depend on configurable values
-    g["ODO_W"] = int(g["WIDTH"] * g["ODO_SCALE"])
-    g["ODO_H"] = int(g["HEIGHT"] * g["ODO_SCALE"])
-    g["K_RGB_64"] = np.array(
-        [[g["FX"], 0, g["CX"]],
-         [0, g["FY"], g["CY"]],
-         [0, 0, 1]], dtype=np.float64)
-    g["CPU_COUNT"] = min(os.cpu_count() or 4, g["JETSON_CORES"])
-    return cfg
-
-
-def _current_config_snapshot():
-    """Return a dict of all configurable parameters and their active values."""
-    g = globals()
-    snap = {}
-    for k in CONFIGURABLE_KEYS:
-        v = g[k]
-        if isinstance(v, np.ndarray):
-            v = v.tolist()
-        snap[k] = v
-    return snap
 
 
 # ====================== Thread-safe bounded LRU cache ======================
@@ -408,12 +470,12 @@ def integrate_gyro(imu_data, imu_times, t_start, t_end):
         wy = imu_data[i][2]
         wz = imu_data[i][3]
         dt = t - prev_t
-        if dt <= 0 or dt > 0.1:
+        if dt <= 0 or dt > IMU_MAX_SAMPLE_GAP:
             prev_t = t
             continue
         norm_w = math.sqrt(wx * wx + wy * wy + wz * wz)
         angle = norm_w * dt
-        if angle > 1e-8:
+        if angle > IMU_MIN_ROTATION_ANGLE:
             ax_x, ax_y, ax_z = wx / norm_w, wy / norm_w, wz / norm_w
             K = np.array([
                 [0,     -ax_z,  ax_y],
@@ -478,7 +540,7 @@ def load_frame_pairs():
     for t_r in rtimes:
         while j + 1 < len(dtimes) and abs(dtimes[j + 1] - t_r) < abs(dtimes[j] - t_r):
             j += 1
-        if abs(dtimes[j] - t_r) < 0.02:
+        if abs(dtimes[j] - t_r) < FRAME_PAIR_MAX_TIME_DIFF:
             pairs.append((t_r, rgb[t_r], dep[dtimes[j]]))
     return pairs
 
@@ -523,14 +585,16 @@ def extract_fpfh(pcd, voxel_size=None, radius_normal=None, radius_feat=None):
         radius_feat = GLC_FPFH_RADIUS_FEAT
 
     pcd_down = pcd.voxel_down_sample(voxel_size)
-    if len(pcd_down.points) < 50:
+    if len(pcd_down.points) < GLC_FPFH_MIN_POINTS:
         return None, None
 
     pcd_down.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+        o3d.geometry.KDTreeSearchParamHybrid(
+            radius=radius_normal, max_nn=GLC_FPFH_NORMAL_MAX_NN))
     fpfh = o3d.pipelines.registration.compute_fpfh_feature(
         pcd_down,
-        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feat, max_nn=100))
+        o3d.geometry.KDTreeSearchParamHybrid(
+            radius=radius_feat, max_nn=GLC_FPFH_FEATURE_MAX_NN))
     return pcd_down, fpfh
 
 
@@ -569,18 +633,18 @@ def compute_pnp_initial_guess(kps_src, kps_tgt, depth_src_path, undist,
                                z])
                 pts_2d.append(kps_tgt[m.trainIdx].pt)
 
-    if len(pts_3d) < 6:
+    if len(pts_3d) < PNP_MIN_POINTS:
         return None
 
     ok, rvec, tvec, inliers = cv2.solvePnPRansac(
         np.array(pts_3d, dtype=np.float64),
         np.array(pts_2d, dtype=np.float64),
         K_RGB_64, None,
-        reprojectionError=3.0,
-        iterationsCount=300,
+        reprojectionError=PNP_REPROJECTION_ERROR,
+        iterationsCount=PNP_ITERATIONS,
         flags=cv2.SOLVEPNP_ITERATIVE)
 
-    if not ok or inliers is None or len(inliers) < 6:
+    if not ok or inliers is None or len(inliers) < PNP_MIN_POINTS:
         return None
 
     R, _ = cv2.Rodrigues(rvec)
@@ -608,39 +672,422 @@ def save_tum_trajectory(trajectory, filename):
                     f"{qx:.6f} {qy:.6f} {qz:.6f} {qw:.6f}\n")
 
 
+def rotation_angle_deg(R):
+    """Rotation angle (degrees) from a 3x3 rotation matrix."""
+    try:
+        return float(math.degrees(rotation_angle(np.asarray(R))))
+    except Exception:
+        return None
+
+
+def safe_float(value):
+    """Convert numeric values to JSON-safe floats, returning None if invalid."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, np.generic):
+            value = value.item()
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def get_memory_mb_safe():
+    """Current process RSS in MB, or None if unavailable."""
+    mem = safe_float(get_memory_mb())
+    if mem is None or mem <= 0:
+        return None
+    return mem
+
+
+def compute_trajectory_motion_metrics(trajectory):
+    metrics = {
+        "total_path_length_m": 0.0,
+        "mean_translation_step_m": None,
+        "max_translation_step_m": None,
+        "std_translation_step_m": None,
+        "mean_rotation_step_deg": None,
+        "max_rotation_step_deg": None,
+        "std_rotation_step_deg": None,
+        "mean_linear_velocity_mps": None,
+        "max_linear_velocity_mps": None,
+        "mean_angular_velocity_dps": None,
+        "max_angular_velocity_dps": None,
+        "head_tail_translation_drift_m": None,
+        "head_tail_rotation_drift_deg": None,
+    }
+    if len(trajectory) == 0:
+        return metrics
+
+    first_T = np.asarray(trajectory[0][1])
+    last_T = np.asarray(trajectory[-1][1])
+    metrics["head_tail_translation_drift_m"] = safe_float(
+        np.linalg.norm(last_T[:3, 3] - first_T[:3, 3]))
+    metrics["head_tail_rotation_drift_deg"] = rotation_angle_deg(
+        first_T[:3, :3].T @ last_T[:3, :3])
+
+    if len(trajectory) < 2:
+        return metrics
+
+    translation_steps = []
+    rotation_steps = []
+    linear_velocities = []
+    angular_velocities = []
+
+    for (ts_prev, T_prev), (ts_cur, T_cur) in zip(trajectory[:-1],
+                                                  trajectory[1:]):
+        T_prev = np.asarray(T_prev)
+        T_cur = np.asarray(T_cur)
+        step_m = safe_float(np.linalg.norm(T_cur[:3, 3] - T_prev[:3, 3]))
+        step_deg = rotation_angle_deg(T_prev[:3, :3].T @ T_cur[:3, :3])
+        if step_m is not None:
+            translation_steps.append(step_m)
+        if step_deg is not None:
+            rotation_steps.append(step_deg)
+        dt = safe_float(ts_cur - ts_prev)
+        if dt is not None and dt > 0:
+            if step_m is not None:
+                linear_velocities.append(step_m / dt)
+            if step_deg is not None:
+                angular_velocities.append(step_deg / dt)
+
+    def _series_stats(values, prefix):
+        if not values:
+            return
+        arr = np.asarray(values, dtype=np.float64)
+        metrics[f"mean_{prefix}"] = safe_float(np.mean(arr))
+        metrics[f"max_{prefix}"] = safe_float(np.max(arr))
+        metrics[f"std_{prefix}"] = safe_float(np.std(arr))
+
+    metrics["total_path_length_m"] = safe_float(sum(translation_steps)) or 0.0
+    _series_stats(translation_steps, "translation_step_m")
+    _series_stats(rotation_steps, "rotation_step_deg")
+    if linear_velocities:
+        arr = np.asarray(linear_velocities, dtype=np.float64)
+        metrics["mean_linear_velocity_mps"] = safe_float(np.mean(arr))
+        metrics["max_linear_velocity_mps"] = safe_float(np.max(arr))
+    if angular_velocities:
+        arr = np.asarray(angular_velocities, dtype=np.float64)
+        metrics["mean_angular_velocity_dps"] = safe_float(np.mean(arr))
+        metrics["max_angular_velocity_dps"] = safe_float(np.max(arr))
+    return metrics
+
+
+def build_parameter_snapshot():
+    params = {
+        "ODO_SCALE": ODO_SCALE,
+        "ODO_W": ODO_W,
+        "ODO_H": ODO_H,
+        "MAX_DEPTH": MAX_DEPTH,
+        "MIN_DEPTH": MIN_DEPTH,
+        "MAX_DEPTH_DIFF": MAX_DEPTH_DIFF,
+        "MAX_VELOCITY": MAX_VELOCITY,
+        "MAX_ANGULAR_VEL": MAX_ANGULAR_VEL,
+        "LC_STRIDE": LC_STRIDE,
+        "LC_GAPS": list(LC_GAPS),
+        "GLC_ORB_FEATURES": GLC_ORB_FEATURES,
+        "GLC_QUERY_STRIDE": GLC_QUERY_STRIDE,
+        "GLC_FPFH_ENABLED": GLC_FPFH_ENABLED,
+        "GLC_FPFH_VOXEL": GLC_FPFH_VOXEL,
+        "GLC_FPFH_QUERY_STRIDE": GLC_FPFH_QUERY_STRIDE,
+        "ICP_SEQ_FITNESS_MIN": ICP_SEQ_FITNESS_MIN,
+        "ICP_SEQ_VOXELS": [list(v) for v in ICP_SEQ_VOXELS],
+        "RGBD_CACHE_SIZE": RGBD_CACHE_SIZE,
+        "PCD_CACHE_SIZE": PCD_CACHE_SIZE,
+        "PCD_LEVEL_CACHE_SIZE": PCD_LEVEL_CACHE_SIZE,
+        "ODO_WORKERS": ODO_WORKERS,
+        "FPFH_WORKERS": FPFH_WORKERS,
+        "GLC_WORKERS": GLC_WORKERS,
+    }
+    params["config"] = POSE_TRACKING_CONFIG
+    params["config_path"] = PROJECT_CONFIG["config_path"]
+    return params
+
+
+def make_quality_judgment(metrics):
+    accepted_ratio = safe_float(metrics.get("accepted_frame_ratio")) or 0.0
+    num_segments = int(metrics.get("num_segments") or 0)
+    drift_m = safe_float(metrics.get("head_tail_translation_drift_m"))
+    runtime_per_frame = safe_float(metrics.get("runtime_per_accepted_frame_sec"))
+
+    excellent_segment_ok = (
+        num_segments == 1 if QJ_EXCELLENT_REQUIRES_SINGLE_SEGMENT else True)
+    if accepted_ratio >= QJ_ACCEPTED_EXCELLENT and excellent_segment_ok:
+        tracking = "Excellent"
+    elif accepted_ratio >= QJ_ACCEPTED_GOOD:
+        tracking = "Good"
+    else:
+        tracking = "Weak"
+
+    if drift_m is None:
+        drift = "Unknown"
+    elif drift_m < QJ_DRIFT_LOW_M:
+        drift = "Low"
+    elif drift_m < QJ_DRIFT_MEDIUM_M:
+        drift = "Medium"
+    else:
+        drift = "High"
+
+    if runtime_per_frame is None:
+        runtime = "Unknown"
+    elif runtime_per_frame < QJ_RUNTIME_FAST_SEC:
+        runtime = "Fast"
+    elif runtime_per_frame < QJ_RUNTIME_MODERATE_SEC:
+        runtime = "Moderate"
+    else:
+        runtime = "Slow"
+
+    if tracking == "Excellent" and drift == "Low" and runtime != "Slow":
+        overall = "Excellent"
+    elif tracking != "Weak" and drift not in ("High", "Unknown"):
+        overall = "Good"
+    else:
+        overall = "Needs Review"
+
+    return {
+        "tracking_stability": tracking,
+        "drift": drift,
+        "runtime": runtime,
+        "overall_run_quality": overall,
+    }
+
+
+def _json_ready(value):
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _json_ready(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_ready(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
+
+
+def _fmt(value, decimals=3, suffix=""):
+    value = safe_float(value)
+    if value is None:
+        return "N/A"
+    return f"{value:.{decimals}f}{suffix}"
+
+
+def _fmt_int(value):
+    try:
+        if value is None:
+            return "N/A"
+        return str(int(value))
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def save_metrics_report(metrics, run_dir):
+    timestamp = metrics.get("timestamp") or datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S")
+    metrics["timestamp"] = timestamp
+    file_stamp = timestamp.replace("-", "").replace(":", "").replace(" ", "_")
+    metrics["run_dir"] = run_dir
+
+    metrics["quality_judgment"] = make_quality_judgment(metrics)
+    for key, value in metrics["quality_judgment"].items():
+        metrics[key] = value
+
+    metrics = _json_ready(metrics)
+    json_path = os.path.join(run_dir, f"metrics_{file_stamp}.json")
+    md_path = os.path.join(run_dir, f"metrics_{file_stamp}.md")
+    csv_path = os.path.join(run_dir, "experiment_summary.csv")
+
+    memory_values = [
+        safe_float(metrics.get(k))
+        for k in (
+            "startup_memory_mb",
+            "after_orb_memory_mb",
+            "after_odometry_memory_mb",
+            "after_global_lc_memory_mb",
+            "final_memory_mb",
+        )
+    ]
+    memory_values = [v for v in memory_values if v is not None]
+    peak_memory = max(memory_values) if memory_values else None
+
+    params = metrics.get("parameters", {})
+    judgment = metrics.get("quality_judgment", {})
+    phase_rows = [
+        ("ORB extraction", "orb_extraction_time_sec"),
+        ("Phase 1 sequential tracking", "phase1_sequential_tracking_time_sec"),
+        ("Phase 2 local LC", "phase2_local_lc_time_sec"),
+        ("Phase 2b global LC", "phase2b_global_lc_time_sec"),
+        ("Phase 3 optimization", "phase3_optimization_time_sec"),
+        ("Total wall time", "total_wall_time_sec"),
+    ]
+
+    md_lines = [
+        "# Pose Trajectory Experiment Report",
+        "",
+        "## Summary",
+        f"- Dataset: {metrics.get('active_dataset', 'N/A')}",
+        f"- Timestamp: {timestamp}",
+        f"- Accepted frame ratio: {_fmt(metrics.get('accepted_frame_ratio'))}",
+        f"- Number of segments: {_fmt_int(metrics.get('num_segments'))}",
+        f"- Head-tail drift: {_fmt(metrics.get('head_tail_translation_drift_m'), 3, ' m')} / "
+        f"{_fmt(metrics.get('head_tail_rotation_drift_deg'), 2, ' deg')}",
+        f"- Total path length: {_fmt(metrics.get('total_path_length_m'), 3, ' m')}",
+        f"- Total runtime: {_fmt(metrics.get('total_wall_time_sec'), 2, ' s')}",
+        f"- Peak/final memory: {_fmt(peak_memory, 1, ' MB')} / "
+        f"{_fmt(metrics.get('final_memory_mb'), 1, ' MB')}",
+        f"- Trajectory file: {metrics.get('trajectory_file', 'N/A')}",
+        "",
+        "## Tracking Quality",
+        f"- Successful odometry edges: {_fmt_int(metrics.get('successful_odometry_edges'))}",
+        f"- Sequential success rate: {_fmt(metrics.get('sequential_success_rate'))}",
+        f"- ICP fallback rate: {_fmt(metrics.get('icp_fallback_rate'))}",
+        f"- IMU used count: {_fmt_int(metrics.get('imu_used_count'))}",
+        f"- Segments: {_fmt_int(metrics.get('num_segments'))}",
+        f"- Largest segment length: {_fmt_int(metrics.get('largest_segment_length'))}",
+        "",
+        "## Motion Quality",
+        f"- Translation step mean/max/std: "
+        f"{_fmt(metrics.get('mean_translation_step_m'), 4, ' m')} / "
+        f"{_fmt(metrics.get('max_translation_step_m'), 4, ' m')} / "
+        f"{_fmt(metrics.get('std_translation_step_m'), 4, ' m')}",
+        f"- Rotation step mean/max/std: "
+        f"{_fmt(metrics.get('mean_rotation_step_deg'), 3, ' deg')} / "
+        f"{_fmt(metrics.get('max_rotation_step_deg'), 3, ' deg')} / "
+        f"{_fmt(metrics.get('std_rotation_step_deg'), 3, ' deg')}",
+        f"- Linear velocity mean/max: "
+        f"{_fmt(metrics.get('mean_linear_velocity_mps'), 4, ' m/s')} / "
+        f"{_fmt(metrics.get('max_linear_velocity_mps'), 4, ' m/s')}",
+        f"- Angular velocity mean/max: "
+        f"{_fmt(metrics.get('mean_angular_velocity_dps'), 3, ' deg/s')} / "
+        f"{_fmt(metrics.get('max_angular_velocity_dps'), 3, ' deg/s')}",
+        "",
+        "## Loop Closure Quality",
+        f"- Local LC: {_fmt_int(metrics.get('local_lc_accepted'))}/"
+        f"{_fmt_int(metrics.get('local_lc_tried'))}, "
+        f"rate {_fmt(metrics.get('local_lc_accept_rate'))}",
+        f"- ORB global LC: {_fmt_int(metrics.get('orb_glc_accepted'))}/"
+        f"{_fmt_int(metrics.get('orb_glc_tried'))}, "
+        f"rate {_fmt(metrics.get('orb_glc_accept_rate'))}",
+        f"- FPFH global LC: {_fmt_int(metrics.get('fpfh_glc_accepted'))}/"
+        f"{_fmt_int(metrics.get('fpfh_glc_tried'))}, "
+        f"rate {_fmt(metrics.get('fpfh_glc_accept_rate'))}",
+        f"- Head-tail LC added: {_fmt_int(metrics.get('head_tail_lc_added'))}",
+        f"- Total global LC added: {_fmt_int(metrics.get('total_global_lc_added'))}",
+        "",
+        "## Pose Graph",
+        f"- Nodes: {_fmt_int(metrics.get('num_pose_graph_nodes'))}",
+        f"- Edges: {_fmt_int(metrics.get('num_pose_graph_edges'))}",
+        f"- Odometry edges: {_fmt_int(metrics.get('num_odometry_edges'))}",
+        f"- Uncertain edges: {_fmt_int(metrics.get('num_uncertain_edges'))}",
+        "",
+        "## Runtime",
+        "| Phase | Seconds |",
+        "|---|---:|",
+    ]
+    for label, key in phase_rows:
+        md_lines.append(f"| {label} | {_fmt(metrics.get(key), 2)} |")
+
+    md_lines.extend([
+        "",
+        "## Memory and Cache",
+        "| Measurement | MB |",
+        "|---|---:|",
+        f"| Startup | {_fmt(metrics.get('startup_memory_mb'), 1)} |",
+        f"| After ORB | {_fmt(metrics.get('after_orb_memory_mb'), 1)} |",
+        f"| After odometry | {_fmt(metrics.get('after_odometry_memory_mb'), 1)} |",
+        f"| After global LC | {_fmt(metrics.get('after_global_lc_memory_mb'), 1)} |",
+        f"| Final | {_fmt(metrics.get('final_memory_mb'), 1)} |",
+        "",
+        f"- RGBD cache: {metrics.get('rgbd_cache_stats', 'N/A')}",
+        f"- PCD cache: {metrics.get('pcd_cache_stats', 'N/A')}",
+        f"- PCD level cache: {metrics.get('pcd_level_cache_stats', 'N/A')}",
+        f"- PnP depth cache: {metrics.get('pnp_depth_cache_stats', 'N/A')}",
+        "",
+        "## Parameter Snapshot",
+        "| Parameter | Value |",
+        "|---|---|",
+    ])
+    for key in sorted(params.keys()):
+        md_lines.append(f"| {key} | `{json.dumps(params[key])}` |")
+
+    md_lines.extend([
+        "",
+        "## Quick Judgment",
+        f"- Tracking stability: {judgment.get('tracking_stability', 'N/A')}",
+        f"- Drift: {judgment.get('drift', 'N/A')}",
+        f"- Runtime: {judgment.get('runtime', 'N/A')}",
+        f"- Overall run quality: {judgment.get('overall_run_quality', 'N/A')}",
+        "",
+    ])
+
+    csv_fields = [
+        "timestamp",
+        "active_dataset",
+        "total_frames",
+        "accepted_frames",
+        "accepted_frame_ratio",
+        "num_segments",
+        "largest_segment_length",
+        "head_tail_translation_drift_m",
+        "head_tail_rotation_drift_deg",
+        "total_path_length_m",
+        "successful_odometry_edges",
+        "sequential_success_rate",
+        "imu_used_count",
+        "icp_fallback_count",
+        "icp_fallback_rate",
+        "local_lc_accept_rate",
+        "orb_glc_accept_rate",
+        "fpfh_glc_accept_rate",
+        "total_global_lc_added",
+        "total_wall_time_sec",
+        "runtime_per_accepted_frame_sec",
+        "final_memory_mb",
+        "tracking_stability",
+        "drift",
+        "runtime",
+        "overall_run_quality",
+        "trajectory_file",
+        "json_report",
+        "markdown_report",
+    ]
+
+    metrics["json_report"] = json_path
+    metrics["markdown_report"] = md_path
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, sort_keys=True)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines))
+
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
+        if write_header:
+            writer.writeheader()
+        row = {key: metrics.get(key) for key in csv_fields}
+        writer.writerow(row)
+
+    return {"json": json_path, "markdown": md_path, "csv": csv_path}
+
+
 # ==================================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description="Jetson Nano Super Optimized RGB-D Odometry")
-    parser.add_argument("--config", type=str, default=None,
-                        help="Path to JSON config file (partial overrides OK)")
-    args = parser.parse_args()
-
-    config_used = {}
-    if args.config:
-        config_used = load_config(args.config)
-        print(f"[CONFIG] Loaded {len(config_used)} override(s) from "
-              f"{args.config}")
-
     wall_start = time.time()
-
     metrics = {
-        "total_frames": 0,
-        "accepted_frames": 0,
-        "skipped_frames": 0,
-        "icp_fallback_count": 0,
-        "local_lc_attempts": 0,
-        "local_lc_accepted": 0,
-        "orb_lc_attempts": 0,
-        "orb_lc_accepted": 0,
-        "fpfh_lc_attempts": 0,
-        "fpfh_lc_accepted": 0,
-        "head_tail_closure_fired": False,
-        "icp_fitness_values": [],
-        "mean_icp_fitness": None,
-        "total_runtime_seconds": None,
-        "config": _current_config_snapshot(),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "active_dataset": ACTIVE_DATASET,
+        "trajectory_file": TRAJ_FILE,
+        "parameters": build_parameter_snapshot(),
+        "startup_memory_mb": get_memory_mb_safe(),
     }
+    run_dir = create_next_run_dir(DATASET_EXPERIMENTS_DIR)
+    metrics["run_dir"] = run_dir
+    print(f"  Active dataset: {ACTIVE_DATASET}")
+    print(f"  Experiment run: {run_dir}")
 
     print("=" * 62)
     print("  JETSON NANO SUPER – Optimised RGB-D Odometry + Pose Graph")
@@ -674,6 +1121,18 @@ def main():
     print(f"[OK] {n} RGB-D frame pairs loaded.\n")
     if n < 2:
         print("Need at least 2 frames.")
+        metrics.update({
+            "accepted_frames": 0,
+            "accepted_frame_ratio": 0.0,
+            "num_segments": 0,
+            "largest_segment_length": 0,
+            "successful_odometry_edges": 0,
+            "sequential_success_rate": 0.0,
+            "total_wall_time_sec": time.time() - wall_start,
+        })
+        report_paths = save_metrics_report(metrics, run_dir)
+        print(f"Reports saved to {report_paths['json']} and "
+              f"{report_paths['markdown']}")
         return
 
     # ---- On-demand RGBD frame store (bounded LRU) ----
@@ -701,8 +1160,11 @@ def main():
             if done % 100 == 0 or done == n:
                 print(f"  {done}/{n}")
     n_feat = sum(1 for d in orb_des.values() if d is not None)
+    orb_extraction_time = time.time() - t_orb
     print(f"  {n_feat}/{n} frames with ORB features  "
-          f"({time.time() - t_orb:.1f}s)")
+          f"({orb_extraction_time:.1f}s)")
+    metrics["orb_extraction_time_sec"] = orb_extraction_time
+    metrics["after_orb_memory_mb"] = get_memory_mb_safe()
     _mem_check("after ORB extraction")
     print()
 
@@ -735,12 +1197,13 @@ def main():
             value = None
         else:
             lvl = base.voxel_down_sample(voxel_size)
-            if len(lvl.points) < 50:
+            if len(lvl.points) < PCD_LEVEL_MIN_POINTS:
                 value = None
             else:
                 lvl.estimate_normals(
                     o3d.geometry.KDTreeSearchParamHybrid(
-                        radius=voxel_size * 4, max_nn=30))
+                        radius=voxel_size * PCD_NORMAL_RADIUS_MULTIPLIER,
+                        max_nn=PCD_NORMAL_MAX_NN))
                 value = lvl
         pcd_level_cache.put(key, value)
         return value
@@ -754,10 +1217,10 @@ def main():
         )
         if fast_mode:
             opt.iteration_number_per_pyramid_level = (
-                o3d.utility.IntVector([6, 4, 3]))
+                o3d.utility.IntVector(ODO_FAST_ITERATIONS))
         else:
             opt.iteration_number_per_pyramid_level = (
-                o3d.utility.IntVector([10, 5, 3]))
+                o3d.utility.IntVector(ODO_FULL_ITERATIONS))
         return opt
 
     def _get_odo_ctx(fast_mode=False):
@@ -787,7 +1250,7 @@ def main():
         return try_odometry(src, tgt, init, fast_mode=False)
 
     def validate_motion(trans, dt):
-        if dt < 0.005:
+        if dt < MOTION_MIN_DT:
             return False
         t_norm = np.linalg.norm(trans[:3, 3])
         angle = rotation_angle(trans[:3, :3])
@@ -828,7 +1291,7 @@ def main():
 
         tn = np.linalg.norm(current_T[:3, 3])
         an = rotation_angle(current_T[:3, :3])
-        if tn > 0.8 or an > 1.2:
+        if tn > ICP_SEQ_MAX_TRANSLATION or an > ICP_SEQ_MAX_ROTATION:
             return False, EYE4.copy(), ZERO66.copy()
 
         ok_odo, trans_odo, info_odo = try_odometry(
@@ -836,7 +1299,8 @@ def main():
         if ok_odo:
             return True, trans_odo, info_odo
 
-        info = np.eye(6) * max(fitness * 8000, 400)
+        info = np.eye(6) * max(fitness * ICP_SEQ_INFO_SCALE,
+                               ICP_SEQ_INFO_MIN)
         return True, current_T, info
 
     # ==============================================================
@@ -871,6 +1335,7 @@ def main():
             if done_count % 100 == 0 or done_count == len(submit_list):
                 print(f"  odometry: {done_count}/{len(submit_list)} pairs")
     t_odo_parallel = time.time() - t_phase1
+    metrics["after_odometry_memory_mb"] = get_memory_mb_safe()
     _mem_check("after parallel odometry")
 
     # Chain poses sequentially using pre-computed transforms
@@ -902,7 +1367,7 @@ def main():
                         icp_used += 1
 
         if not connected:
-            for back in range(min(3, len(seg))):
+            for back in range(min(RECOVERY_BACKTRACK_FRAMES, len(seg))):
                 last = seg[-(back + 1)]
                 if last == i - 1 and i in consec_results:
                     continue
@@ -934,9 +1399,11 @@ def main():
                 skip_run = 0
 
     total_accepted = sum(len(s) for s in segments)
+    successful_odometry_edges = len(odo_edges)
+    phase1_time = time.time() - t_phase1
     print(f"  Accepted {total_accepted}/{n} frames in {len(segments)} segment(s)  "
           f"(IMU {imu_used}×, ICP fallback {icp_used}×)  "
-          f"({time.time() - t_phase1:.1f}s, parallel odo {t_odo_parallel:.1f}s)")
+          f"({phase1_time:.1f}s, parallel odo {t_odo_parallel:.1f}s)")
     if icp_used > 0:
         print(f"  ** {icp_used} frame(s) recovered by depth-only ICP **")
     print()
@@ -951,16 +1418,30 @@ def main():
 
     accepted = best_seg
     n_acc = len(accepted)
-    metrics["accepted_frames"] = n_acc
-    metrics["skipped_frames"] = n - n_acc
-    metrics["icp_fallback_count"] = icp_used
+    metrics.update({
+        "accepted_frames": n_acc,
+        "accepted_frame_ratio": n_acc / n if n else 0.0,
+        "num_segments": len(segments),
+        "largest_segment_length": max((len(s) for s in segments), default=0),
+        "successful_odometry_edges": successful_odometry_edges,
+        "sequential_success_rate": (
+            successful_odometry_edges / (n - 1) if n > 1 else 0.0),
+        "imu_used_count": imu_used,
+        "icp_fallback_count": icp_used,
+        "icp_fallback_rate": (
+            icp_used / successful_odometry_edges
+            if successful_odometry_edges > 0 else 0.0),
+        "phase1_sequential_tracking_time_sec": phase1_time,
+    })
     print(f"  Building pose graph for {n_acc} accepted frames.\n")
 
     # ==============================================================
     # Phase 2 – Local loop-closure edges
     # ==============================================================
     local_lc_gaps = list(LC_GAPS)
-    if len(segments) == 1 and n_acc >= 600 and total_accepted == n:
+    if (len(segments) == 1
+            and n_acc >= LC_FULL_ACCEPT_MIN_FRAMES
+            and total_accepted == n):
         local_lc_gaps = [min(LC_GAPS)]
 
     print(f"Phase 2: Local loop closures "
@@ -1014,11 +1495,16 @@ def main():
             o3d.pipelines.registration.PoseGraphEdge(
                 j, k, trans, info, uncertain=True))
     lc_ok = len(lc_edges)
+    phase2_time = time.time() - t_phase2
+    metrics.update({
+        "local_lc_tried": lc_tried,
+        "local_lc_accepted": lc_ok,
+        "local_lc_accept_rate": lc_ok / lc_tried if lc_tried else 0.0,
+        "phase2_local_lc_time_sec": phase2_time,
+    })
 
-    metrics["local_lc_attempts"] = lc_tried
-    metrics["local_lc_accepted"] = lc_ok
     print(f"  Local loop closures: {lc_ok}/{lc_tried} accepted  "
-          f"({time.time() - t_phase2:.1f}s)\n")
+          f"({phase2_time:.1f}s)\n")
 
     # ==============================================================
     # Phase 2b – Global Loop Closure (ORB + FPFH + head-tail ICP)
@@ -1032,16 +1518,15 @@ def main():
     def try_icp_edge(q_node, t_node, init,
                      refine_with_odometry=True,
                      odometry_full_retry=False):
-        """Returns (ok, transform, info, icp_fitness)."""
         pcd_s = get_pcd(q_node)
         pcd_t = get_pcd(t_node)
         if pcd_s is None or pcd_t is None:
-            return False, None, None, 0.0
+            return False, None, None
         s_idx = accepted[q_node]
         t_idx = accepted[t_node]
         current_T = init.copy()
         fitness = 0.0
-        for vs, max_d, max_it in [(0.08, 0.40, 20), (0.04, 0.15, 12)]:
+        for vs, max_d, max_it in GLC_ICP_VOXELS:
             src_d = get_pcd_level(s_idx, vs)
             tgt_d = get_pcd_level(t_idx, vs)
             if src_d is None or tgt_d is None:
@@ -1055,23 +1540,25 @@ def main():
             fitness = result.fitness
         T_icp = current_T
         if fitness < GLC_ICP_FITNESS_MIN:
-            return False, None, None, fitness
+            return False, None, None
         tn = np.linalg.norm(T_icp[:3, 3])
         an = rotation_angle(T_icp[:3, :3])
         if tn > GLC_MAX_TRANSLATION or an > GLC_MAX_ROTATION:
-            return False, None, None, fitness
+            return False, None, None
         if not refine_with_odometry:
-            info_icp = np.eye(6) * max(fitness * 10000, 500)
-            return True, T_icp, info_icp, fitness
+            info_icp = np.eye(6) * max(fitness * GLC_ICP_INFO_SCALE,
+                                        GLC_ICP_INFO_MIN)
+            return True, T_icp, info_icp
         ok, trans, info = try_odometry_fast_then_full(
             s_idx, t_idx, T_icp, full_retry=odometry_full_retry)
         if ok:
             tn2 = np.linalg.norm(trans[:3, 3])
             an2 = rotation_angle(trans[:3, :3])
             if tn2 <= GLC_MAX_TRANSLATION and an2 <= GLC_MAX_ROTATION:
-                return True, trans, info, fitness
-        info_icp = np.eye(6) * max(fitness * 10000, 500)
-        return True, T_icp, info_icp, fitness
+                return True, trans, info
+        info_icp = np.eye(6) * max(fitness * GLC_ICP_INFO_SCALE,
+                                    GLC_ICP_INFO_MIN)
+        return True, T_icp, info_icp
 
     # ---- Map pre-extracted ORB features to accepted-frame nodes ----
     print("  Mapping ORB features to accepted frames...")
@@ -1191,13 +1678,13 @@ def main():
                     local_closed = True
                     continue
 
-            ok_icp, T_icp, info_icp, icp_fit = try_icp_edge(
+            ok_icp, T_icp, info_icp = try_icp_edge(
                 q, t_node, init,
                 refine_with_odometry=True,
                 odometry_full_retry=(not GLC_FAST_ONLY_ODO))
             if ok_icp:
                 local_edges.append(
-                    (q, t_node, T_icp, info_icp, n_inliers, "icp", icp_fit))
+                    (q, t_node, T_icp, info_icp, n_inliers, "icp"))
                 local_closed = True
 
         return q, local_tried, local_closed, local_edges
@@ -1212,19 +1699,13 @@ def main():
         glc_tried += local_tried
         if local_closed:
             orb_closed_queries.add(q)
-        for edge in local_edges:
-            a, b, trans, info, n_inliers, method = edge[:6]
-            icp_fit = edge[6] if len(edge) > 6 else None
+        for a, b, trans, info, n_inliers, method in local_edges:
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
                     a, b, trans, info, uncertain=True))
             glc_ok += 1
             glc_edges.append((a, b, n_inliers, method))
-            if icp_fit is not None and icp_fit > 0:
-                metrics["icp_fitness_values"].append(icp_fit)
 
-    metrics["orb_lc_attempts"] = glc_tried
-    metrics["orb_lc_accepted"] = glc_ok
     print(f"  ORB-based global LC: {glc_ok}/{glc_tried} verified & added")
     _mem_check("after ORB global LC")
 
@@ -1281,7 +1762,7 @@ def main():
 
         def _extract_fpfh_node(j):
             pcd_j = get_pcd(j)
-            if pcd_j is None or len(pcd_j.points) < 50:
+            if pcd_j is None or len(pcd_j.points) < GLC_FPFH_MIN_POINTS:
                 return j, None, None, None
             pcd_down, fpfh_feat = extract_fpfh(pcd_j)
             if fpfh_feat is None:
@@ -1340,16 +1821,19 @@ def main():
                             GLC_FPFH_RANSAC_DIST,
                             o3d.pipelines.registration
                             .TransformationEstimationPointToPoint(False),
-                            3,
+                            GLC_FPFH_RANSAC_N,
                             [
                                 o3d.pipelines.registration
-                                .CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                                .CorrespondenceCheckerBasedOnEdgeLength(
+                                    GLC_FPFH_RANSAC_EDGE_LENGTH),
                                 o3d.pipelines.registration
                                 .CorrespondenceCheckerBasedOnDistance(
                                     GLC_FPFH_RANSAC_DIST),
                             ],
                             o3d.pipelines.registration
-                            .RANSACConvergenceCriteria(2500, 0.999)))
+                            .RANSACConvergenceCriteria(
+                                GLC_FPFH_RANSAC_MAX_ITER,
+                                GLC_FPFH_RANSAC_CONFIDENCE)))
                 except TypeError:
                     try:
                         ransac_result = (
@@ -1360,29 +1844,31 @@ def main():
                                 GLC_FPFH_RANSAC_DIST,
                                 o3d.pipelines.registration
                                 .TransformationEstimationPointToPoint(False),
-                                3,
+                                GLC_FPFH_RANSAC_N,
                                 [
                                     o3d.pipelines.registration
                                     .CorrespondenceCheckerBasedOnEdgeLength(
-                                        0.9),
+                                        GLC_FPFH_RANSAC_EDGE_LENGTH),
                                     o3d.pipelines.registration
                                     .CorrespondenceCheckerBasedOnDistance(
                                         GLC_FPFH_RANSAC_DIST),
                                 ],
                                 o3d.pipelines.registration
-                                .RANSACConvergenceCriteria(8000, 0.999)))
+                                .RANSACConvergenceCriteria(
+                                    GLC_FPFH_RANSAC_LEGACY_MAX_ITER,
+                                    GLC_FPFH_RANSAC_CONFIDENCE)))
                     except Exception:
                         continue
 
                 if ransac_result.fitness < GLC_FPFH_FITNESS_MIN:
                     continue
 
-                ok_icp, T_icp, info_icp, icp_fit = try_icp_edge(
+                ok_icp, T_icp, info_icp = try_icp_edge(
                     q, t, ransac_result.transformation,
                     refine_with_odometry=(not GLC_FPFH_SKIP_ODO_REFINE),
                     odometry_full_retry=False)
                 if ok_icp:
-                    local_edges.append((q, t, T_icp, info_icp, icp_fit))
+                    local_edges.append((q, t, T_icp, info_icp))
 
             return q, local_tried, local_edges
 
@@ -1395,7 +1881,7 @@ def main():
         fpfh_results.sort(key=lambda x: x[0])
         for _, local_tried, local_edges in fpfh_results:
             fpfh_tried += local_tried
-            for q, t, T_icp, info_icp, icp_fit in local_edges:
+            for q, t, T_icp, info_icp in local_edges:
                 key = (min(q, t), max(q, t))
                 if key in seen_pairs:
                     continue
@@ -1405,11 +1891,7 @@ def main():
                         q, t, T_icp, info_icp, uncertain=True))
                 fpfh_ok += 1
                 glc_edges.append((q, t, 0, "fpfh"))
-                if icp_fit > 0:
-                    metrics["icp_fitness_values"].append(icp_fit)
 
-        metrics["fpfh_lc_attempts"] = fpfh_tried
-        metrics["fpfh_lc_accepted"] = fpfh_ok
         print(f"  FPFH-based global LC: {fpfh_ok}/{fpfh_tried} "
               f"verified & added")
     else:
@@ -1417,8 +1899,10 @@ def main():
 
     # ---- Head-tail ICP (full-circle detection) ----
     ht_ok = 0
-    head_nodes = list(range(0, min(GLC_HEAD_TAIL_N, n_acc), 3))
-    tail_nodes = list(range(max(0, n_acc - GLC_HEAD_TAIL_N), n_acc, 3))
+    head_nodes = list(range(0, min(GLC_HEAD_TAIL_N, n_acc),
+                            GLC_HEAD_TAIL_STRIDE))
+    tail_nodes = list(range(max(0, n_acc - GLC_HEAD_TAIL_N), n_acc,
+                            GLC_HEAD_TAIL_STRIDE))
     ht_possible = (len(tail_nodes) > 0 and len(head_nodes) > 0
                    and tail_nodes[0] - head_nodes[-1] >= GLC_MIN_INTERVAL)
 
@@ -1434,15 +1918,13 @@ def main():
                 pose_init = np.linalg.inv(poses[t_idx]) @ poses[s_idx]
                 best_ok = False
                 best_T = best_info = None
-                best_fit = 0.0
                 for init_guess in [pose_init, EYE4]:
-                    ok_i, T_i, info_i, fit_i = try_icp_edge(
+                    ok_i, T_i, info_i = try_icp_edge(
                         t_n, h_n, init_guess,
                         refine_with_odometry=True,
                         odometry_full_retry=(not GLC_FAST_ONLY_ODO))
                     if ok_i:
-                        best_ok, best_T, best_info, best_fit = (
-                            True, T_i, info_i, fit_i)
+                        best_ok, best_T, best_info = True, T_i, info_i
                         break
                 if best_ok:
                     pose_graph.edges.append(
@@ -1451,13 +1933,9 @@ def main():
                     ht_ok += 1
                     glc_edges.append((t_n, h_n, 0, "ht-icp"))
                     existing.add((t_n, h_n))
-                    if best_fit > 0:
-                        metrics["icp_fitness_values"].append(best_fit)
         print(f"  Head-tail ICP loop closures: {ht_ok} added")
     else:
         print("  Trajectory too short for head-tail ICP check.")
-
-    metrics["head_tail_closure_fired"] = ht_ok > 0
 
     glc_total = glc_ok + fpfh_ok + ht_ok
     if glc_edges:
@@ -1475,9 +1953,23 @@ def main():
         if len(to_show) < len(glc_edges):
             print(f"    ... {len(glc_edges) - len(to_show)} more edges "
                   f"omitted")
+    phase2b_time = time.time() - t_phase2b
+    metrics.update({
+        "orb_glc_tried": glc_tried,
+        "orb_glc_accepted": glc_ok,
+        "orb_glc_accept_rate": glc_ok / glc_tried if glc_tried else 0.0,
+        "fpfh_glc_tried": fpfh_tried,
+        "fpfh_glc_accepted": fpfh_ok,
+        "fpfh_glc_accept_rate": (
+            fpfh_ok / fpfh_tried if fpfh_tried else 0.0),
+        "head_tail_lc_added": ht_ok,
+        "total_global_lc_added": glc_total,
+        "phase2b_global_lc_time_sec": phase2b_time,
+        "after_global_lc_memory_mb": get_memory_mb_safe(),
+    })
     print(f"  Total global edges: {glc_total} "
           f"(ORB={glc_ok}, FPFH={fpfh_ok}, head-tail={ht_ok})  "
-          f"({time.time() - t_phase2b:.1f}s)\n")
+          f"({phase2b_time:.1f}s)\n")
     _mem_check("after global LC")
 
     # ==============================================================
@@ -1486,27 +1978,21 @@ def main():
     print("Phase 3: Pose-graph optimisation (two-pass)...")
     t_phase3 = time.time()
 
-    opt1 = o3d.pipelines.registration.GlobalOptimizationOption(
-        max_correspondence_distance=0.10,
-        edge_prune_threshold=0.25,
-        reference_node=0)
-    o3d.pipelines.registration.global_optimization(
-        pose_graph,
-        o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
-        o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
-        opt1)
-    print("  Pass 1 (coarse) done")
-
-    opt2 = o3d.pipelines.registration.GlobalOptimizationOption(
-        max_correspondence_distance=0.03,
-        edge_prune_threshold=0.25,
-        reference_node=0)
-    o3d.pipelines.registration.global_optimization(
-        pose_graph,
-        o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
-        o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
-        opt2)
-    print(f"  Pass 2 (fine) done  ({time.time() - t_phase3:.1f}s)\n")
+    for pass_idx, pass_cfg in enumerate(PGO_PASSES, start=1):
+        opt = o3d.pipelines.registration.GlobalOptimizationOption(
+            max_correspondence_distance=(
+                pass_cfg["max_correspondence_distance"]),
+            edge_prune_threshold=pass_cfg["edge_prune_threshold"],
+            reference_node=pass_cfg["reference_node"])
+        o3d.pipelines.registration.global_optimization(
+            pose_graph,
+            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+            opt)
+        print(f"  Pass {pass_idx} ({pass_cfg['name']}) done")
+    phase3_time = time.time() - t_phase3
+    metrics["phase3_optimization_time_sec"] = phase3_time
+    print(f"  Pose-graph optimisation done  ({phase3_time:.1f}s)\n")
 
     # ==============================================================
     # Save trajectory
@@ -1518,33 +2004,46 @@ def main():
 
     save_tum_trajectory(trajectory, TRAJ_FILE)
     elapsed = time.time() - wall_start
+    final_memory_mb = get_memory_mb_safe()
+    num_uncertain_edges = sum(
+        1 for e in pose_graph.edges if getattr(e, "uncertain", False))
+    num_pose_graph_edges = len(pose_graph.edges)
+    metrics.update(compute_trajectory_motion_metrics(trajectory))
+    metrics.update({
+        "trajectory_file": TRAJ_FILE,
+        "num_pose_graph_nodes": len(pose_graph.nodes),
+        "num_pose_graph_edges": num_pose_graph_edges,
+        "num_odometry_edges": num_pose_graph_edges - num_uncertain_edges,
+        "num_uncertain_edges": num_uncertain_edges,
+        "total_wall_time_sec": elapsed,
+        "runtime_per_accepted_frame_sec": (
+            elapsed / n_acc if n_acc > 0 else None),
+        "final_memory_mb": final_memory_mb,
+    })
     print(f"Saved {n_acc} poses to {TRAJ_FILE}")
     print(f"Total wall time: {elapsed:.1f}s")
     _mem_check("final")
 
+    rgbd_cache_stats = rgbd_store.stats()
+    pcd_cache_stats = pcd_cache.stats()
+    pcd_level_cache_stats = pcd_level_cache.stats()
+    pnp_depth_cache_stats = pnp_depth_lru.stats()
+    metrics.update({
+        "rgbd_cache_stats": rgbd_cache_stats,
+        "pcd_cache_stats": pcd_cache_stats,
+        "pcd_level_cache_stats": pcd_level_cache_stats,
+        "pnp_depth_cache_stats": pnp_depth_cache_stats,
+    })
+
     print(f"\n  Cache statistics (Jetson simulation):")
-    print(f"    {rgbd_store.stats()}")
-    print(f"    {pcd_cache.stats()}")
-    print(f"    {pcd_level_cache.stats()}")
-    print(f"    {pnp_depth_lru.stats()}")
+    print(f"    {rgbd_cache_stats}")
+    print(f"    {pcd_cache_stats}")
+    print(f"    {pcd_level_cache_stats}")
+    print(f"    {pnp_depth_cache_stats}")
+    report_paths = save_metrics_report(metrics, run_dir)
+    print(f"Reports saved to {report_paths['json']} and "
+          f"{report_paths['markdown']}")
     print()
-
-    # ---- Finalize and write metrics ----
-    metrics["total_runtime_seconds"] = round(elapsed, 3)
-    fit_vals = metrics["icp_fitness_values"]
-    if fit_vals:
-        metrics["mean_icp_fitness"] = round(
-            sum(fit_vals) / len(fit_vals), 6)
-    else:
-        metrics["mean_icp_fitness"] = None
-
-    metrics_path = os.environ.get(
-        "METRICS_OUT", os.path.join(BASE_DIR, "metrics.json"))
-    os.makedirs(os.path.dirname(os.path.abspath(metrics_path)), exist_ok=True)
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"[METRICS] Written to {metrics_path}")
-
     print("Run 3.build_pointcloud.py next.")
 
 
